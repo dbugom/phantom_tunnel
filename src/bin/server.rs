@@ -427,6 +427,9 @@ async fn send_frame(
         .encrypt(&plaintext, &mut ciphertext)
         .context("Failed to encrypt frame")?;
 
+    debug!("Sending frame type {:?} stream {} ({} bytes encrypted, {} bytes plaintext)",
+           frame.frame_type, frame.stream_id, ct_len, plaintext.len());
+
     let len_bytes = (ct_len as u16).to_be_bytes();
     stream.write_all(&len_bytes).await?;
     stream.write_all(&ciphertext[..ct_len]).await?;

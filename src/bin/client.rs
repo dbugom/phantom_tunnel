@@ -360,10 +360,18 @@ async fn run_tunnel(
             } => {
                 match read_result {
                     Ok(frame_len) => {
+                        debug!("Received encrypted frame: {} bytes", frame_len);
+
                         // Decrypt frame
-                        let plaintext_len = noise_transport
-                            .decrypt(&buf[..frame_len], &mut frame_buf)
-                            .context("Failed to decrypt frame")?;
+                        let plaintext_len = match noise_transport
+                            .decrypt(&buf[..frame_len], &mut frame_buf) {
+                            Ok(len) => len,
+                            Err(e) => {
+                                error!("Decrypt failed for frame of {} bytes: {:?}", frame_len, e);
+                                error!("First 16 bytes: {:02x?}", &buf[..16.min(frame_len)]);
+                                return Err(anyhow::anyhow!("Failed to decrypt frame: {:?}", e));
+                            }
+                        };
 
                         // Decode frame
                         let mut frame_bytes = bytes::BytesMut::from(&frame_buf[..plaintext_len]);
@@ -427,29 +435,15 @@ async fn run_tunnel(
                         }
                     }
                     TunnelCommand::SendData { stream_id, data } => {
-                        // Queue data frame for sending
+                        // Send data frame
                         let frame = Frame::data(stream_id, data);
-                        let plaintext = frame.encode();
-                        let mut ciphertext = vec![0u8; plaintext.len() + 16];
-
-                        if let Ok(ct_len) = noise_transport.encrypt(&plaintext, &mut ciphertext) {
-                            let len_bytes = (ct_len as u16).to_be_bytes();
-                            let _ = stream.write_all(&len_bytes).await;
-                            let _ = stream.write_all(&ciphertext[..ct_len]).await;
-                        }
+                        send_frame(&mut stream, &mut noise_transport, &frame).await?;
                     }
                     TunnelCommand::CloseStream { stream_id } => {
                         active_streams.remove(&stream_id);
-                        // Queue close frame
+                        // Send close frame
                         let frame = Frame::stream_close(stream_id);
-                        let plaintext = frame.encode();
-                        let mut ciphertext = vec![0u8; plaintext.len() + 16];
-
-                        if let Ok(ct_len) = noise_transport.encrypt(&plaintext, &mut ciphertext) {
-                            let len_bytes = (ct_len as u16).to_be_bytes();
-                            let _ = stream.write_all(&len_bytes).await;
-                            let _ = stream.write_all(&ciphertext[..ct_len]).await;
-                        }
+                        send_frame(&mut stream, &mut noise_transport, &frame).await?;
                     }
                 }
             }
@@ -522,6 +516,9 @@ async fn send_frame(
     let ct_len = noise
         .encrypt(&plaintext, &mut ciphertext)
         .context("Failed to encrypt frame")?;
+
+    debug!("Sending frame type {:?} stream {} ({} bytes encrypted)",
+           frame.frame_type, frame.stream_id, ct_len);
 
     let len_bytes = (ct_len as u16).to_be_bytes();
     stream.write_all(&len_bytes).await?;
