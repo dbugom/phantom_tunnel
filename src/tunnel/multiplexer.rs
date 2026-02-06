@@ -38,6 +38,7 @@ pub enum StreamCommand {
 /// Stream handle for application use
 pub struct StreamHandle {
     stream_id: u32,
+    destination: Option<String>,
     cmd_tx: mpsc::Sender<StreamCommand>,
     event_rx: mpsc::Receiver<StreamEvent>,
 }
@@ -46,6 +47,11 @@ impl StreamHandle {
     /// Get stream ID
     pub fn id(&self) -> u32 {
         self.stream_id
+    }
+
+    /// Get destination address (if this is an incoming stream)
+    pub fn destination(&self) -> Option<&str> {
+        self.destination.as_deref()
     }
 
     /// Send data on this stream
@@ -150,6 +156,7 @@ impl Multiplexer {
 
         Ok(StreamHandle {
             stream_id,
+            destination: Some(destination),
             cmd_tx: self.cmd_tx.clone(),
             event_rx,
         })
@@ -226,7 +233,7 @@ impl Multiplexer {
         let destination = self.parse_destination(&payload)?;
 
         let (event_tx, event_rx) = mpsc::channel(64);
-        let stream = TunnelStream::with_destination(stream_id, destination);
+        let stream = TunnelStream::with_destination(stream_id, destination.clone());
 
         self.streams.insert(
             stream_id,
@@ -238,12 +245,14 @@ impl Multiplexer {
 
         Ok(StreamHandle {
             stream_id,
+            destination: Some(destination),
             cmd_tx: self.cmd_tx.clone(),
             event_rx,
         })
     }
 
     /// Parse destination address from STREAM_OPEN payload
+    /// Supports both SOCKS5 binary format and plain string format (e.g., "example.com:443")
     fn parse_destination(&self, payload: &[u8]) -> Result<String, TunnelError> {
         if payload.is_empty() {
             return Err(TunnelError::InvalidFrame("Empty destination".to_string()));
@@ -252,7 +261,7 @@ impl Multiplexer {
         let addr_type = payload[0];
         match addr_type {
             0x01 => {
-                // IPv4
+                // IPv4 binary format
                 if payload.len() < 7 {
                     return Err(TunnelError::InvalidFrame("Invalid IPv4".to_string()));
                 }
@@ -264,7 +273,7 @@ impl Multiplexer {
                 Ok(format!("{}:{}", ip, port))
             }
             0x03 => {
-                // Domain
+                // Domain binary format
                 if payload.len() < 2 {
                     return Err(TunnelError::InvalidFrame("Invalid domain".to_string()));
                 }
@@ -277,7 +286,7 @@ impl Multiplexer {
                 Ok(format!("{}:{}", domain, port))
             }
             0x04 => {
-                // IPv6
+                // IPv6 binary format
                 if payload.len() < 19 {
                     return Err(TunnelError::InvalidFrame("Invalid IPv6".to_string()));
                 }
@@ -287,10 +296,21 @@ impl Multiplexer {
                 let port = u16::from_be_bytes([payload[17], payload[18]]);
                 Ok(format!("[{}]:{}", ip, port))
             }
-            _ => Err(TunnelError::InvalidFrame(format!(
-                "Unknown address type: {}",
-                addr_type
-            ))),
+            _ => {
+                // Plain string format (e.g., "example.com:443")
+                // This is the format used by our client
+                match std::str::from_utf8(payload) {
+                    Ok(s) if s.contains(':') => Ok(s.to_string()),
+                    Ok(s) => Err(TunnelError::InvalidFrame(format!(
+                        "Invalid destination (no port): {}",
+                        s
+                    ))),
+                    Err(_) => Err(TunnelError::InvalidFrame(format!(
+                        "Unknown address type: {}",
+                        addr_type
+                    ))),
+                }
+            }
         }
     }
 

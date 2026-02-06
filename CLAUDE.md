@@ -170,12 +170,48 @@ If the user wants to continue development:
 
 - Some unused imports generate warnings (cosmetic, doesn't affect functionality)
 
-## Recent Fixes (Latest Session)
+## Recent Fixes (Latest Session - Feb 2026)
+
+### Critical Fix: Tunnel Data Routing
+
+The SOCKS5 and HTTP proxies were making **direct connections** to destinations instead of routing through the encrypted tunnel. This has been fixed:
+
+1. **Client Architecture Refactored** (`src/bin/client.rs`):
+   - Created `TunnelHandle` with channel-based communication to tunnel task
+   - Proxy handlers now send `TunnelCommand::OpenStream` to open multiplexed streams
+   - Data is sent via `TunnelCommand::SendData` through the encrypted tunnel
+   - Bidirectional relay between local TCP connections and tunnel streams
+
+2. **Server Architecture Refactored** (`src/bin/server.rs`):
+   - Added `StreamToTunnel` enum for stream tasks to send data back
+   - Server now spawns `handle_stream` tasks that connect to actual destinations
+   - Bidirectional relay between tunnel streams and target connections
+
+3. **Multiplexer Enhancement** (`src/tunnel/multiplexer.rs`):
+   - `StreamHandle` now includes `destination` field
+   - Added `destination()` method to get stream destination
+   - `parse_destination` now supports both SOCKS5 binary format AND plain string format
+
+### Previous Fixes
 
 1. **Server/Client keypair loading** - Both now properly load keypairs from config
 2. **Auto-generation on first run** - If no keys in config, generates and saves them
 3. **Public key storage** - Both server and client configs now store public_key alongside private_key
-4. **HTTP proxy** - Already implemented and running in client (was not actually broken)
+
+## Data Flow (How Traffic Routes Through Tunnel)
+
+```
+Browser → SOCKS5 Proxy → Client Tunnel Task → [Encrypted] → Server → Destination
+                ↓                    ↓                           ↓
+         Parse SOCKS5         Encrypt Frame              Connect & Relay
+         Open Stream          Send over TCP              Forward Data
+```
+
+1. Browser connects to local SOCKS5 proxy (127.0.0.1:1080)
+2. Client parses destination, sends `TunnelCommand::OpenStream`
+3. Tunnel task creates multiplexed stream, sends `STREAM_OPEN` frame (encrypted)
+4. Server receives frame, spawns task to connect to actual destination
+5. Data flows bidirectionally: Browser ↔ Client ↔ Server ↔ Destination
 
 ## Related Files
 

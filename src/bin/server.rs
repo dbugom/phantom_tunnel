@@ -10,14 +10,14 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use phantom_tunnel::{
     config::Config,
-    crypto::{KeyPair, NoiseHandshake, PrivateKey, PublicKey},
-    tunnel::{Frame, Multiplexer},
+    crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
+    tunnel::{Frame, FrameType, Multiplexer},
 };
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
 /// Phantom Tunnel Server - Secure, censorship-resistant tunnel
@@ -51,6 +51,19 @@ struct ServerState {
     allowed_clients: HashSet<String>,
     /// Connection semaphore for limiting concurrent connections
     conn_semaphore: Semaphore,
+}
+
+/// Command to send data back through the tunnel
+enum StreamToTunnel {
+    /// Data to send on a stream
+    Data { stream_id: u32, data: bytes::Bytes },
+    /// Stream closed
+    Close { stream_id: u32 },
+}
+
+/// Active stream with channel to send data to it
+struct ActiveStream {
+    data_tx: mpsc::Sender<bytes::Bytes>,
 }
 
 #[tokio::main]
@@ -220,64 +233,135 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
     // Create multiplexer
     let mut mux = Multiplexer::new_server();
 
+    // Track active streams
+    let mut active_streams: HashMap<u32, ActiveStream> = HashMap::new();
+
+    // Channel for stream tasks to send data back through tunnel
+    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<StreamToTunnel>(256);
+
     // Main loop: handle frames
     let mut buf = vec![0u8; 65536];
     let mut frame_buf = vec![0u8; 65536];
 
     loop {
-        // Read frame length
-        let mut len_buf = [0u8; 2];
-        match stream.read_exact(&mut len_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                debug!("Client disconnected");
+        tokio::select! {
+            // Read frame from client
+            read_result = async {
+                let mut len_buf = [0u8; 2];
+                stream.read_exact(&mut len_buf).await?;
+                let frame_len = u16::from_be_bytes(len_buf) as usize;
+
+                if frame_len > buf.len() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Frame too large: {}", frame_len)
+                    ));
+                }
+
+                stream.read_exact(&mut buf[..frame_len]).await?;
+                Ok::<_, std::io::Error>(frame_len)
+            } => {
+                match read_result {
+                    Ok(frame_len) => {
+                        // Decrypt frame
+                        let plaintext_len = noise_transport
+                            .decrypt(&buf[..frame_len], &mut frame_buf)
+                            .context("Failed to decrypt frame")?;
+
+                        // Decode frame
+                        let mut frame_bytes = bytes::BytesMut::from(&frame_buf[..plaintext_len]);
+                        let frame = match Frame::decode(&mut frame_bytes)? {
+                            Some(f) => f,
+                            None => continue,
+                        };
+
+                        // Handle different frame types
+                        match frame.frame_type {
+                            FrameType::StreamOpen => {
+                                // New stream request
+                                match mux.handle_frame(frame).await {
+                                    Ok(Some(stream_handle)) => {
+                                        let stream_id = stream_handle.id();
+                                        let destination = stream_handle.destination()
+                                            .map(|s| s.to_string())
+                                            .unwrap_or_else(|| "unknown".to_string());
+
+                                        info!("Opening stream {} to {}", stream_id, destination);
+
+                                        // Create channel for sending data to this stream
+                                        let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(256);
+                                        active_streams.insert(stream_id, ActiveStream { data_tx });
+
+                                        // Spawn task to connect to destination and relay data
+                                        let tunnel_tx = tunnel_tx.clone();
+                                        tokio::spawn(async move {
+                                            if let Err(e) = handle_stream(stream_id, destination, data_rx, tunnel_tx).await {
+                                                debug!("Stream {} error: {}", stream_id, e);
+                                            }
+                                        });
+                                    }
+                                    Ok(None) => {}
+                                    Err(e) => {
+                                        debug!("Stream open error: {}", e);
+                                    }
+                                }
+                            }
+                            FrameType::Data => {
+                                // Forward data to appropriate stream handler
+                                let stream_id = frame.stream_id;
+                                if let Some(active) = active_streams.get(&stream_id) {
+                                    if active.data_tx.send(frame.payload).await.is_err() {
+                                        // Stream handler closed, remove it
+                                        active_streams.remove(&stream_id);
+                                    }
+                                }
+                            }
+                            FrameType::StreamClose => {
+                                // Remove stream
+                                let stream_id = frame.stream_id;
+                                active_streams.remove(&stream_id);
+                                let _ = mux.handle_frame(frame).await;
+                            }
+                            _ => {
+                                // Handle other frames through multiplexer
+                                let _ = mux.handle_frame(frame).await;
+                            }
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        debug!("Client disconnected");
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(e.into());
+                    }
+                }
+            }
+
+            // Handle data from stream handlers to send back through tunnel
+            Some(cmd) = tunnel_rx.recv() => {
+                match cmd {
+                    StreamToTunnel::Data { stream_id, data } => {
+                        // Send data frame to client
+                        let frame = Frame::data(stream_id, data);
+                        send_frame(&mut stream, &mut noise_transport, &frame).await?;
+                    }
+                    StreamToTunnel::Close { stream_id } => {
+                        // Send close frame to client
+                        active_streams.remove(&stream_id);
+                        let frame = Frame::stream_close(stream_id);
+                        send_frame(&mut stream, &mut noise_transport, &frame).await?;
+                    }
+                }
+            }
+
+            // Shutdown
+            else => {
                 break;
             }
-            Err(e) => return Err(e.into()),
         }
 
-        let frame_len = u16::from_be_bytes(len_buf) as usize;
-        if frame_len > buf.len() {
-            return Err(anyhow!("Frame too large: {}", frame_len));
-        }
-
-        // Read encrypted frame
-        stream.read_exact(&mut buf[..frame_len]).await?;
-
-        // Decrypt frame
-        let plaintext_len = noise_transport
-            .decrypt(&buf[..frame_len], &mut frame_buf)
-            .context("Failed to decrypt frame")?;
-
-        // Decode frame
-        let mut frame_bytes = bytes::BytesMut::from(&frame_buf[..plaintext_len]);
-        let frame = match Frame::decode(&mut frame_bytes)? {
-            Some(f) => f,
-            None => continue,
-        };
-
-        // Handle frame
-        match mux.handle_frame(frame).await {
-            Ok(Some(stream_handle)) => {
-                // New stream opened - spawn handler
-                let dest = "TODO".to_string(); // Get from stream
-                debug!("New stream {} to {}", stream_handle.id(), dest);
-
-                tokio::spawn(async move {
-                    if let Err(e) = handle_stream(stream_handle).await {
-                        debug!("Stream error: {}", e);
-                    }
-                });
-            }
-            Ok(None) => {}
-            Err(e) => {
-                debug!("Frame handling error: {}", e);
-            }
-        }
-
-        // Process commands and send queued frames
-        mux.process_commands().await?;
-
+        // Send any queued frames from multiplexer
         for frame in mux.take_send_queue() {
             send_frame(&mut stream, &mut noise_transport, &frame).await?;
         }
@@ -290,7 +374,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
 async fn perform_handshake(
     stream: &mut TcpStream,
     keypair: &KeyPair,
-) -> Result<(phantom_tunnel::crypto::NoiseTransport, PublicKey)> {
+) -> Result<(NoiseTransport, PublicKey)> {
     let mut handshake = NoiseHandshake::new_responder(keypair)
         .context("Failed to create handshake")?;
 
@@ -333,7 +417,7 @@ async fn perform_handshake(
 /// Send an encrypted frame
 async fn send_frame(
     stream: &mut TcpStream,
-    noise: &mut phantom_tunnel::crypto::NoiseTransport,
+    noise: &mut NoiseTransport,
     frame: &Frame,
 ) -> Result<()> {
     let plaintext = frame.encode();
@@ -352,26 +436,66 @@ async fn send_frame(
 
 /// Handle a single stream (connect to destination, relay data)
 async fn handle_stream(
-    mut stream_handle: phantom_tunnel::tunnel::StreamHandle,
+    stream_id: u32,
+    destination: String,
+    mut data_rx: mpsc::Receiver<bytes::Bytes>,
+    tunnel_tx: mpsc::Sender<StreamToTunnel>,
 ) -> Result<()> {
-    // TODO: Get destination from stream and connect
-    // For now, just drain events
-    while let Some(event) = stream_handle.recv().await {
-        match event {
-            phantom_tunnel::tunnel::StreamEvent::Data(data) => {
-                debug!("Stream {} received {} bytes", stream_handle.id(), data.len());
-                // TODO: Forward to destination
+    // Connect to destination
+    let mut target = match TcpStream::connect(&destination).await {
+        Ok(t) => {
+            info!("Stream {} connected to {}", stream_id, destination);
+            t
+        }
+        Err(e) => {
+            error!("Stream {} failed to connect to {}: {}", stream_id, destination, e);
+            // Send close to client
+            let _ = tunnel_tx.send(StreamToTunnel::Close { stream_id }).await;
+            return Err(e.into());
+        }
+    };
+
+    let (mut target_read, mut target_write) = target.into_split();
+    let tunnel_tx_clone = tunnel_tx.clone();
+
+    // Task to read from target and send to tunnel
+    let target_to_tunnel = tokio::spawn(async move {
+        let mut buf = vec![0u8; 32768];
+        loop {
+            match target_read.read(&mut buf).await {
+                Ok(0) => {
+                    // EOF from target
+                    break;
+                }
+                Ok(n) => {
+                    let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                    if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    debug!("Stream {} target read error: {}", stream_id, e);
+                    break;
+                }
             }
-            phantom_tunnel::tunnel::StreamEvent::Close => {
-                debug!("Stream {} closed", stream_handle.id());
-                break;
-            }
-            phantom_tunnel::tunnel::StreamEvent::WindowUpdate(_) => {}
-            phantom_tunnel::tunnel::StreamEvent::Error(e) => {
-                debug!("Stream {} error: {}", stream_handle.id(), e);
+        }
+        // Send close when target disconnects
+        let _ = tunnel_tx_clone.send(StreamToTunnel::Close { stream_id }).await;
+    });
+
+    // Task to read from tunnel and send to target
+    let tunnel_to_target = tokio::spawn(async move {
+        while let Some(data) = data_rx.recv().await {
+            if target_write.write_all(&data).await.is_err() {
                 break;
             }
         }
+    });
+
+    // Wait for either direction to complete
+    tokio::select! {
+        _ = target_to_tunnel => {}
+        _ = tunnel_to_target => {}
     }
 
     Ok(())
