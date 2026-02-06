@@ -29,11 +29,28 @@ cd phantom_tunnel
 
 # Build
 cargo build --release
-
-# Binaries are in target/release/
 ```
 
-### Server Setup
+### Easy Setup (Recommended)
+
+Run the interactive setup script - it guides you through everything:
+
+```bash
+./setup.sh
+```
+
+The script will:
+1. Ask if you're setting up a **server** or **client**
+2. Guide you through all configuration options
+3. Generate keypairs automatically
+4. Create the config file for you
+
+### Manual Setup
+
+<details>
+<summary>Click to expand manual setup instructions</summary>
+
+#### Server Setup
 
 ```bash
 # 1. Create config file
@@ -48,7 +65,7 @@ On first run, the server will:
 - Save it to your config file
 - Print the public key to share with clients
 
-### Client Setup
+#### Client Setup
 
 ```bash
 # 1. Create config file
@@ -64,6 +81,8 @@ cp examples/client.config.toml config.toml
 The client starts local proxies:
 - **SOCKS5**: `127.0.0.1:1080`
 - **HTTP**: `127.0.0.1:8080`
+
+</details>
 
 ### Configure Your Applications
 
