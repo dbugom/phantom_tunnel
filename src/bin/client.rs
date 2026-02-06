@@ -410,24 +410,36 @@ async fn run_tunnel(
                             Ok(handle) => {
                                 let stream_id = handle.id();
 
+                                // CRITICAL: Send the STREAM_OPEN frame IMMEDIATELY before returning
+                                // This ensures STREAM_OPEN arrives at server before any DATA frames
+                                let mut send_failed = false;
+                                for frame in mux.take_send_queue() {
+                                    if let Err(e) = send_frame(&mut stream, &mut noise_transport, &frame).await {
+                                        error!("Failed to send STREAM_OPEN: {}", e);
+                                        send_failed = true;
+                                        break;
+                                    }
+                                }
+
+                                if send_failed {
+                                    let _ = req.response_tx.send(Err("Failed to send stream open".to_string()));
+                                    continue;
+                                }
+
                                 // Create channels for this stream's data
                                 let (data_tx, data_rx) = mpsc::channel(256);
-                                let (outgoing_tx, mut outgoing_rx) = mpsc::channel::<bytes::Bytes>(256);
 
                                 // Store the sender for incoming data
-                                active_streams.insert(stream_id, ActiveStream { data_tx });
-
-                                // Spawn task to handle outgoing data for this stream
-                                let cmd_tx_clone = req.response_tx;
+                                active_streams.insert(stream_id, ActiveStream { data_tx: data_tx.clone() });
 
                                 // Send the connection back to the proxy handler
                                 let conn = StreamConnection {
                                     stream_id,
-                                    data_tx: outgoing_tx,
+                                    data_tx,
                                     data_rx,
                                 };
 
-                                let _ = cmd_tx_clone.send(Ok(conn));
+                                let _ = req.response_tx.send(Ok(conn));
                             }
                             Err(e) => {
                                 let _ = req.response_tx.send(Err(format!("Failed to open stream: {}", e)));
