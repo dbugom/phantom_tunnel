@@ -1,0 +1,77 @@
+# Phantom Tunnel Configuration Example
+# Copy this file to config.toml and modify as needed
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+# Log format: pretty, json, compact
+format = "pretty"
+# Optional log file (comment out to log to stdout only)
+# file = "/var/log/phantom-tunnel.log"
+
+# =============================================================================
+# SERVER CONFIGURATION
+# Uncomment this section when running as a server
+# =============================================================================
+[server]
+# Address to listen on
+listen = "0.0.0.0:443"
+
+# Server's private key (base64)
+# Generate with: phantom-server --generate-key
+private_key = "YOUR_SERVER_PRIVATE_KEY_HERE"
+
+# Allowed client public keys (base64)
+# Only clients with keys in this list can connect
+allowed_clients = [
+    # "client1_public_key_base64",
+    # "client2_public_key_base64",
+]
+
+# TLS certificate for obfuscation layer
+# If not provided, uses self-signed (less effective camouflage)
+# tls_cert = "/etc/phantom-tunnel/cert.pem"
+# tls_key = "/etc/phantom-tunnel/key.pem"
+
+# Decoy website to serve for invalid/probe requests
+# This helps resist active probing attacks
+# decoy_site = "https://example.com"
+
+# Maximum concurrent connections
+max_connections = 1000
+
+# =============================================================================
+# CLIENT CONFIGURATION
+# Uncomment this section when running as a client
+# =============================================================================
+[client]
+# Server address to connect to
+server = "your-server.example.com:443"
+
+# Server's public key (base64)
+# Obtain from server admin
+server_public_key = "SERVER_PUBLIC_KEY_HERE"
+
+# Client's private key (base64)
+# Generate with: phantom-client --generate-key
+private_key = "YOUR_CLIENT_PRIVATE_KEY_HERE"
+
+# Local SOCKS5 proxy address
+# Applications connect here to use the tunnel
+socks5_listen = "127.0.0.1:1080"
+
+# Local HTTP proxy address (optional)
+http_listen = "127.0.0.1:8080"
+
+# TLS SNI to use for camouflage
+# Should be a legitimate site hosted on similar infrastructure
+# tls_sni = "www.google.com"
+
+# TLS fingerprint profile: chrome, firefox, safari, edge
+tls_profile = "chrome"
+
+# Enable traffic padding (recommended for censored networks)
+enable_padding = true

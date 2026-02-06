@@ -1,0 +1,57 @@
+# Phantom Tunnel Client Configuration
+# Copy to ~/.config/phantom_tunnel/config.toml
+
+[client]
+# Server address
+# Format: hostname:port or IP:port
+server = "your-server.example.com:443"
+
+# Server's public key (base64 encoded)
+# Obtain from server administrator
+server_public_key = ""
+
+# Client's private key (base64 encoded)
+# Leave empty on first run - will auto-generate and save
+# Or generate with: phantom-client --generate-key
+private_key = ""
+
+# Client's public key (base64 encoded)
+# Auto-generated with private_key - share this with server admin
+public_key = ""
+
+# Local SOCKS5 proxy address
+# Applications connect here to use the tunnel
+# Set to empty string to disable SOCKS5
+socks5_listen = "127.0.0.1:1080"
+
+# Local HTTP CONNECT proxy address
+# For applications that don't support SOCKS5
+# Set to empty string to disable HTTP proxy
+http_listen = "127.0.0.1:8080"
+
+# TLS Server Name Indication (SNI)
+# Appears in unencrypted TLS handshake
+# Use a popular CDN domain for camouflage in censored regions
+# Examples: "cdn.cloudflare.com", "ajax.googleapis.com", "cdn.jsdelivr.net"
+# tls_sni = "cdn.cloudflare.com"
+
+# TLS fingerprint profile to mimic
+# Helps avoid detection by mimicking real browser connections
+# Options: chrome, firefox, safari, edge, ios_safari, android_chrome, random
+tls_profile = "chrome"
+
+# Enable traffic padding
+# Adds random padding to obscure traffic patterns
+# Recommended for censored environments, disable for better performance
+enable_padding = true
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: pretty, json, compact
+format = "pretty"
+
+# Log file (optional)
+# Omit to log to stdout
+# file = "~/.local/share/phantom_tunnel/client.log"

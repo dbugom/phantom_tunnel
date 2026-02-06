@@ -1,0 +1,105 @@
+[package]
+name = "phantom_tunnel"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A secure, censorship-resistant tunneling protocol"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/phantom_tunnel"
+keywords = ["tunnel", "proxy", "privacy", "censorship", "encryption"]
+categories = ["network-programming", "cryptography"]
+
+[features]
+default = ["tls", "socks5", "http-proxy"]
+tls = ["rustls", "tokio-rustls", "webpki-roots"]
+socks5 = []
+http-proxy = ["hyper", "http-body-util"]
+dns-tunnel = ["hickory-resolver", "hickory-proto"]
+quic = ["quinn"]
+full = ["tls", "socks5", "http-proxy", "dns-tunnel", "quic"]
+
+[[bin]]
+name = "phantom-server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "phantom-client"
+path = "src/bin/client.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.43", features = ["full"] }
+
+# Noise Protocol for secure handshake (CRITICAL for privacy)
+snow = "0.9"
+
+# Cryptographic primitives
+ring = "0.17"
+rand = "0.8"
+
+# TLS (rustls is pure Rust, auditable, no OpenSSL backdoor risk)
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", optional = true }
+webpki-roots = { version = "0.26", optional = true }
+
+# QUIC (optional - use as secondary transport, QUIC is targeted by GFW)
+quinn = { version = "0.11", optional = true }
+
+# DNS (for DNS tunneling fallback - excellent for censored environments)
+hickory-resolver = { version = "0.24", optional = true }
+hickory-proto = { version = "0.24", optional = true }
+
+# HTTP (for HTTP CONNECT proxy)
+hyper = { version = "1.5", features = ["http1", "server", "client"], optional = true }
+http-body-util = { version = "0.1", optional = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+bincode = "1.3"
+
+# Utilities
+bytes = "1.9"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4.5", features = ["derive"] }
+base64 = "0.22"
+hex = "0.4"
+md5 = "0.7"  # For JA3 fingerprint calculation
+
+# Async utilities
+futures = "0.3"
+async-trait = "0.1"
+pin-project-lite = "0.2"
+
+[dev-dependencies]
+tokio-test = "0.4"
+criterion = { version = "0.5", features = ["html_reports"] }
+tempfile = "3.15"
+
+# Benchmarks (uncomment when benchmark files are created)
+# [[bench]]
+# name = "crypto_bench"
+# harness = false
+
+# [[bench]]
+# name = "tunnel_bench"
+# harness = false
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.release-small]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

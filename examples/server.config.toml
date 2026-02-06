@@ -1,0 +1,49 @@
+# Phantom Tunnel Server Configuration
+# Copy to /etc/phantom_tunnel/config.toml
+
+[server]
+# Address to listen on
+# Use 0.0.0.0:443 for standard HTTPS port (requires root or CAP_NET_BIND_SERVICE)
+# Use higher port (e.g., 8443) for non-root deployment
+listen = "0.0.0.0:443"
+
+# Server's private key (base64 encoded)
+# Leave empty on first run - will auto-generate and save
+# Or generate with: phantom-server --generate-key
+private_key = ""
+
+# Server's public key (base64 encoded)
+# Auto-generated with private_key - share this with clients
+public_key = ""
+
+# List of allowed client public keys (base64 encoded)
+# Empty list allows no clients
+# Add client public keys here to grant access
+allowed_clients = [
+    # "ABC123...",  # User 1
+    # "XYZ789...",  # User 2
+]
+
+# Maximum concurrent connections
+# Increase for high-traffic servers
+max_connections = 1000
+
+# TLS certificate for outer layer encryption
+# Recommended: Use Let's Encrypt
+# tls_cert = "/etc/letsencrypt/live/yourdomain.com/fullchain.pem"
+# tls_key = "/etc/letsencrypt/live/yourdomain.com/privkey.pem"
+
+# Decoy website path
+# Serves static content to non-tunnel requests (censorship resistance)
+# decoy_site = "/var/www/decoy"
+
+[logging]
+# Log level: trace, debug, info, warn, error
+level = "info"
+
+# Log format: pretty, json, compact
+format = "json"
+
+# Log file (optional)
+# Omit to log to stdout
+file = "/var/log/phantom_tunnel/server.log"
