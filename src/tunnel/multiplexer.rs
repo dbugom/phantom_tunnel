@@ -321,7 +321,7 @@ impl Multiplexer {
         }
     }
 
-    /// Handle stream close
+    /// Handle stream close from remote
     async fn handle_stream_close(&mut self, stream_id: u32) -> Result<(), TunnelError> {
         if let Some(state) = self.streams.get_mut(&stream_id) {
             state.stream.close_remote();
@@ -332,6 +332,25 @@ impl Multiplexer {
             }
         }
         Ok(())
+    }
+
+    /// Close a stream locally (client-initiated close)
+    /// Marks the local side as closed and queues a STREAM_CLOSE frame.
+    /// If both sides are closed, removes the stream from the map.
+    pub fn close_stream_local(&mut self, stream_id: u32) {
+        if let Some(state) = self.streams.get_mut(&stream_id) {
+            state.stream.close_local();
+            self.send_queue.push(Frame::stream_close(stream_id));
+
+            if state.stream.is_closed() {
+                self.streams.remove(&stream_id);
+            }
+        }
+    }
+
+    /// Force-remove a stream from the multiplexer (for cleanup of zombie streams)
+    pub fn remove_stream(&mut self, stream_id: u32) {
+        self.streams.remove(&stream_id);
     }
 
     /// Handle window update

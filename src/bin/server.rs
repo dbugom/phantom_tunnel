@@ -330,6 +330,8 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                 for stream_id in expired {
                     trace!("Removing expired draining stream {}", stream_id);
                     active_streams.remove(&stream_id);
+                    // Also remove from multiplexer to free the stream slot
+                    mux.remove_stream(stream_id);
                 }
             }
             // Receive frames from reader task
@@ -460,8 +462,8 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                                 stream.draining_since = Some(Instant::now());
                             }
                         }
-                        let frame = Frame::stream_close(stream_id);
-                        send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                        // Close local side in multiplexer (marks HalfClosedLocal, queues STREAM_CLOSE frame)
+                        mux.close_stream_local(stream_id);
                     }
                 }
             }
