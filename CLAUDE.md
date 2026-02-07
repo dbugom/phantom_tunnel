@@ -72,8 +72,8 @@ phantom_tunnel/
 ├── src/
 │   ├── lib.rs             # Library exports, VERSION constant
 │   ├── bin/
-│   │   ├── server.rs      # ~350 lines
-│   │   └── client.rs      # ~600 lines
+│   │   ├── server.rs      # ~600 lines
+│   │   └── client.rs      # ~750 lines
 │   ├── config/mod.rs      # Config structs, TOML parsing
 │   ├── crypto/
 │   │   ├── mod.rs
@@ -170,9 +170,31 @@ If the user wants to continue development:
 
 - Some unused imports generate warnings (cosmetic, doesn't affect functionality)
 
-## Recent Fixes (Latest Session - Feb 2026)
+## Git Branching Policy
 
-### Critical Fix: Tunnel Data Routing
+- **`main` branch is STABLE** - Do not commit directly to main
+- **Create new branches** for any new features or fixes
+- Branch naming: `feature/<name>` or `fix/<name>`
+- Merge to main only after testing
+
+## Recent Fixes (Feb 2026)
+
+### Critical Fix: select! Cancellation Bug (Latest)
+
+Both client and server had a critical bug where Tokio's `select!` macro could cancel read operations mid-stream when processing other events. This caused bytes to be lost from the TCP stream, leading to decryption failures ("Decrypt failed for frame") and "Connection reset by peer" errors.
+
+**Root Cause:** When `select!` chooses one branch, it cancels pending futures in other branches. If a read was partially complete (e.g., read length prefix but not frame body), those bytes were lost.
+
+**Fix Applied to Both Client and Server:**
+1. Added `ReaderMessage` enum for channel-based communication
+2. Created dedicated reader task that runs independently (cannot be cancelled)
+3. Added `perform_handshake_split()` for split stream handshakes
+4. Added `send_frame_write()` for sending frames via `OwnedWriteHalf`
+5. Main loop now receives complete frames via channel instead of reading directly
+
+**Commit:** `6635736` - Fix select! cancellation bug causing frame loss and decrypt errors
+
+### Previous Fix: Tunnel Data Routing
 
 The SOCKS5 and HTTP proxies were making **direct connections** to destinations instead of routing through the encrypted tunnel. This has been fixed:
 
@@ -192,7 +214,7 @@ The SOCKS5 and HTTP proxies were making **direct connections** to destinations i
    - Added `destination()` method to get stream destination
    - `parse_destination` now supports both SOCKS5 binary format AND plain string format
 
-### Previous Fixes
+### Other Fixes
 
 1. **Server/Client keypair loading** - Both now properly load keypairs from config
 2. **Auto-generation on first run** - If no keys in config, generates and saves them
@@ -220,4 +242,4 @@ Browser → SOCKS5 Proxy → Client Tunnel Task → [Encrypted] → Server → D
 
 ## Last Updated
 
-2024 - All tasks complete, 54 tests passing
+Feb 2026 - All tasks complete, 54 tests passing, select! bug fixed
