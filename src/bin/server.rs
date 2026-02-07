@@ -687,7 +687,8 @@ async fn handle_stream(
 
     // Task to read from target and send to tunnel
     let target_to_tunnel = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+        // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
+        let mut buf = vec![0u8; 65512];
         loop {
             match target_read.read(&mut buf).await {
                 Ok(0) => {

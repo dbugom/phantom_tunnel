@@ -874,7 +874,8 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
+                // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
+                let mut buf = vec![0u8; 65512];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break, // EOF
@@ -978,7 +979,8 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 65536];
+                // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
+                let mut buf = vec![0u8; 65512];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break,
