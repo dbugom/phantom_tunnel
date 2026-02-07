@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, warn};
 
@@ -208,8 +209,18 @@ fn generate_keypair() -> Result<()> {
     Ok(())
 }
 
+/// Message from the reader task
+enum ReaderMessage {
+    /// Encrypted frame data received
+    Frame(Vec<u8>),
+    /// Reader encountered an error
+    Error(String),
+    /// Connection closed
+    Closed,
+}
+
 /// Handle a single client connection
-async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
+async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
     // Acquire connection permit
     let _permit = state
         .conn_semaphore
@@ -217,9 +228,12 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
         .await
         .context("Failed to acquire connection permit")?;
 
+    // Split stream for handshake
+    let (mut read_half, mut write_half) = stream.into_split();
+
     // Perform Noise handshake
     let (mut noise_transport, client_public) =
-        perform_handshake(&mut stream, &state.keypair).await?;
+        perform_handshake_split(&mut read_half, &mut write_half, &state.keypair).await?;
 
     // Verify client is allowed
     let client_key_b64 = client_public.to_base64();
@@ -230,6 +244,44 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
 
     info!("Client connected: {}...", &client_key_b64[..16]);
 
+    // Create channel for reader task to send frames to main loop
+    let (reader_tx, mut reader_rx) = mpsc::channel::<ReaderMessage>(256);
+
+    // Spawn dedicated reader task - this will NOT be cancelled by select!
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 65536];
+        loop {
+            // Read length prefix
+            let mut len_buf = [0u8; 2];
+            if let Err(e) = read_half.read_exact(&mut len_buf).await {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    let _ = reader_tx.send(ReaderMessage::Closed).await;
+                } else {
+                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                }
+                break;
+            }
+
+            let frame_len = u16::from_be_bytes(len_buf) as usize;
+            if frame_len > buf.len() {
+                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len))).await;
+                break;
+            }
+
+            // Read frame data
+            if let Err(e) = read_half.read_exact(&mut buf[..frame_len]).await {
+                let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                break;
+            }
+
+            // Send complete frame to main loop
+            let frame_data = buf[..frame_len].to_vec();
+            if reader_tx.send(ReaderMessage::Frame(frame_data)).await.is_err() {
+                break; // Main loop closed
+            }
+        }
+    });
+
     // Create multiplexer
     let mut mux = Multiplexer::new_server();
 
@@ -239,34 +291,23 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
     // Channel for stream tasks to send data back through tunnel
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<StreamToTunnel>(256);
 
-    // Main loop: handle frames
-    let mut buf = vec![0u8; 65536];
+    // Buffer for decryption
     let mut frame_buf = vec![0u8; 65536];
 
     loop {
         tokio::select! {
-            // Read frame from client
-            read_result = async {
-                let mut len_buf = [0u8; 2];
-                stream.read_exact(&mut len_buf).await?;
-                let frame_len = u16::from_be_bytes(len_buf) as usize;
-
-                if frame_len > buf.len() {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!("Frame too large: {}", frame_len)
-                    ));
-                }
-
-                stream.read_exact(&mut buf[..frame_len]).await?;
-                Ok::<_, std::io::Error>(frame_len)
-            } => {
-                match read_result {
-                    Ok(frame_len) => {
+            // Receive frames from reader task
+            Some(msg) = reader_rx.recv() => {
+                match msg {
+                    ReaderMessage::Frame(encrypted_data) => {
                         // Decrypt frame
-                        let plaintext_len = noise_transport
-                            .decrypt(&buf[..frame_len], &mut frame_buf)
-                            .context("Failed to decrypt frame")?;
+                        let plaintext_len = match noise_transport.decrypt(&encrypted_data, &mut frame_buf) {
+                            Ok(len) => len,
+                            Err(e) => {
+                                error!("Decrypt failed for frame of {} bytes: {:?}", encrypted_data.len(), e);
+                                return Err(anyhow!("Failed to decrypt frame"));
+                            }
+                        };
 
                         // Decode frame
                         let mut frame_bytes = bytes::BytesMut::from(&frame_buf[..plaintext_len]);
@@ -274,6 +315,9 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
                             Some(f) => f,
                             None => continue,
                         };
+
+                        debug!("Received frame: type={:?} stream={} payload={} bytes",
+                               frame.frame_type, frame.stream_id, frame.payload.len());
 
                         // Handle different frame types
                         match frame.frame_type {
@@ -319,6 +363,7 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
                             FrameType::StreamClose => {
                                 // Remove stream
                                 let stream_id = frame.stream_id;
+                                debug!("Client closed stream {}", stream_id);
                                 active_streams.remove(&stream_id);
                                 let _ = mux.handle_frame(frame).await;
                             }
@@ -328,12 +373,13 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
                             }
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                    ReaderMessage::Error(e) => {
+                        error!("Reader error: {}", e);
+                        return Err(anyhow!("Reader error: {}", e));
+                    }
+                    ReaderMessage::Closed => {
                         debug!("Client disconnected");
                         break;
-                    }
-                    Err(e) => {
-                        return Err(e.into());
                     }
                 }
             }
@@ -344,13 +390,13 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
                     StreamToTunnel::Data { stream_id, data } => {
                         // Send data frame to client
                         let frame = Frame::data(stream_id, data);
-                        send_frame(&mut stream, &mut noise_transport, &frame).await?;
+                        send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
                     }
                     StreamToTunnel::Close { stream_id } => {
                         // Send close frame to client
                         active_streams.remove(&stream_id);
                         let frame = Frame::stream_close(stream_id);
-                        send_frame(&mut stream, &mut noise_transport, &frame).await?;
+                        send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
                     }
                 }
             }
@@ -363,14 +409,60 @@ async fn handle_connection(mut stream: TcpStream, state: Arc<ServerState>) -> Re
 
         // Send any queued frames from multiplexer
         for frame in mux.take_send_queue() {
-            send_frame(&mut stream, &mut noise_transport, &frame).await?;
+            send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
         }
     }
 
     Ok(())
 }
 
-/// Perform Noise IK handshake
+/// Perform Noise IK handshake with split streams
+async fn perform_handshake_split(
+    read_half: &mut OwnedReadHalf,
+    write_half: &mut OwnedWriteHalf,
+    keypair: &KeyPair,
+) -> Result<(NoiseTransport, PublicKey)> {
+    let mut handshake = NoiseHandshake::new_responder(keypair)
+        .context("Failed to create handshake")?;
+
+    let mut buf = [0u8; 65535];
+    let mut payload_buf = [0u8; 65535];
+
+    // Read first message (-> e, es, s, ss)
+    let mut len_buf = [0u8; 2];
+    read_half.read_exact(&mut len_buf).await?;
+    let msg_len = u16::from_be_bytes(len_buf) as usize;
+
+    read_half.read_exact(&mut buf[..msg_len]).await?;
+
+    handshake
+        .read_message(&buf[..msg_len], &mut payload_buf)
+        .context("Failed to read handshake message 1")?;
+
+    // Get client's public key
+    let client_public = handshake
+        .get_remote_static()
+        .ok_or_else(|| anyhow!("Failed to get client public key"))?;
+
+    // Send response (<- e, ee, se)
+    let len = handshake
+        .write_message(&[], &mut buf)
+        .context("Failed to write handshake message 2")?;
+
+    let len_bytes = (len as u16).to_be_bytes();
+    write_half.write_all(&len_bytes).await?;
+    write_half.write_all(&buf[..len]).await?;
+
+    // Convert to transport mode
+    let noise_transport = handshake
+        .into_transport()
+        .context("Failed to enter transport mode")?;
+
+    Ok((noise_transport, client_public))
+}
+
+/// Perform Noise IK handshake (legacy, for non-split streams)
+#[allow(dead_code)]
 async fn perform_handshake(
     stream: &mut TcpStream,
     keypair: &KeyPair,
@@ -414,7 +506,31 @@ async fn perform_handshake(
     Ok((noise_transport, client_public))
 }
 
-/// Send an encrypted frame
+/// Send an encrypted frame using split write half
+async fn send_frame_write(
+    write_half: &mut OwnedWriteHalf,
+    noise: &mut NoiseTransport,
+    frame: &Frame,
+) -> Result<()> {
+    let plaintext = frame.encode();
+    let mut ciphertext = vec![0u8; plaintext.len() + 16];
+
+    let ct_len = noise
+        .encrypt(&plaintext, &mut ciphertext)
+        .context("Failed to encrypt frame")?;
+
+    debug!("Sending frame type {:?} stream {} ({} bytes encrypted, {} bytes plaintext)",
+           frame.frame_type, frame.stream_id, ct_len, plaintext.len());
+
+    let len_bytes = (ct_len as u16).to_be_bytes();
+    write_half.write_all(&len_bytes).await?;
+    write_half.write_all(&ciphertext[..ct_len]).await?;
+
+    Ok(())
+}
+
+/// Send an encrypted frame (legacy, for non-split streams)
+#[allow(dead_code)]
 async fn send_frame(
     stream: &mut TcpStream,
     noise: &mut NoiseTransport,
@@ -445,7 +561,7 @@ async fn handle_stream(
     tunnel_tx: mpsc::Sender<StreamToTunnel>,
 ) -> Result<()> {
     // Connect to destination
-    let mut target = match TcpStream::connect(&destination).await {
+    let target = match TcpStream::connect(&destination).await {
         Ok(t) => {
             info!("Stream {} connected to {}", stream_id, destination);
             t
