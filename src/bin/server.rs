@@ -62,9 +62,10 @@ enum StreamToTunnel {
     Close { stream_id: u32 },
 }
 
-/// Active stream with channel to send data to it
+/// Active stream with channel to send data to it and abort handle
 struct ActiveStream {
     data_tx: mpsc::Sender<bytes::Bytes>,
+    abort_handle: tokio::task::AbortHandle,
 }
 
 #[tokio::main]
@@ -334,14 +335,19 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
 
                                         // Create channel for sending data to this stream
                                         let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(256);
-                                        active_streams.insert(stream_id, ActiveStream { data_tx });
 
                                         // Spawn task to connect to destination and relay data
                                         let tunnel_tx = tunnel_tx.clone();
-                                        tokio::spawn(async move {
+                                        let task_handle = tokio::spawn(async move {
                                             if let Err(e) = handle_stream(stream_id, destination, data_rx, tunnel_tx).await {
                                                 debug!("Stream {} error: {}", stream_id, e);
                                             }
+                                        });
+
+                                        // Store with abort handle so we can stop it when client closes
+                                        active_streams.insert(stream_id, ActiveStream {
+                                            data_tx,
+                                            abort_handle: task_handle.abort_handle(),
                                         });
                                     }
                                     Ok(None) => {}
@@ -355,16 +361,22 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                                 let stream_id = frame.stream_id;
                                 if let Some(active) = active_streams.get(&stream_id) {
                                     if active.data_tx.send(frame.payload).await.is_err() {
-                                        // Stream handler closed, remove it
-                                        active_streams.remove(&stream_id);
+                                        // Stream handler closed, remove and abort
+                                        if let Some(stream) = active_streams.remove(&stream_id) {
+                                            stream.abort_handle.abort();
+                                        }
                                     }
                                 }
                             }
                             FrameType::StreamClose => {
-                                // Remove stream
+                                // Remove stream and abort its relay task
                                 let stream_id = frame.stream_id;
                                 debug!("Client closed stream {}", stream_id);
-                                active_streams.remove(&stream_id);
+                                if let Some(stream) = active_streams.remove(&stream_id) {
+                                    // Abort the relay task to stop reading from target
+                                    stream.abort_handle.abort();
+                                    debug!("Aborted relay task for stream {}", stream_id);
+                                }
                                 let _ = mux.handle_frame(frame).await;
                             }
                             _ => {

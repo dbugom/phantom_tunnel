@@ -14,7 +14,7 @@ use phantom_tunnel::{
     obfuscation::BrowserProfile,
     tunnel::{Frame, FrameType, Multiplexer},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -391,6 +391,10 @@ async fn run_tunnel(
     // Track active streams: stream_id -> sender for incoming data
     let mut active_streams: HashMap<u32, ActiveStream> = HashMap::new();
 
+    // Track recently closed streams to silently discard late-arriving data
+    // This prevents warning spam when server sends data for streams we've closed
+    let mut recently_closed: HashSet<u32> = HashSet::new();
+
     // Buffer for decryption
     let mut frame_buf = vec![0u8; 65536];
 
@@ -422,14 +426,20 @@ async fn run_tunnel(
                             if frame.frame_type == FrameType::Data {
                                 if let Some(active) = active_streams.get(&frame.stream_id) {
                                     if active.data_tx.send(frame.payload.clone()).await.is_err() {
-                                        warn!("Failed to forward data to stream {}: channel closed", frame.stream_id);
+                                        debug!("Stream {} channel closed, discarding data", frame.stream_id);
+                                        active_streams.remove(&frame.stream_id);
+                                        recently_closed.insert(frame.stream_id);
                                     }
+                                } else if recently_closed.contains(&frame.stream_id) {
+                                    // Silently discard data for recently closed streams
+                                    debug!("Discarding late data for closed stream {}", frame.stream_id);
                                 } else {
-                                    warn!("Received data for unknown stream {}", frame.stream_id);
+                                    debug!("Received data for unknown stream {}", frame.stream_id);
                                 }
                             } else if frame.frame_type == FrameType::StreamClose {
                                 debug!("Server closed stream {}", frame.stream_id);
                                 active_streams.remove(&frame.stream_id);
+                                recently_closed.remove(&frame.stream_id); // Server acknowledged, fully closed
                             }
 
                             // Let multiplexer handle frame for bookkeeping
@@ -503,9 +513,11 @@ async fn run_tunnel(
                     }
                     TunnelCommand::CloseStream { stream_id } => {
                         active_streams.remove(&stream_id);
-                        // Send close frame
+                        recently_closed.insert(stream_id); // Track to discard late-arriving data
+                        // Send close frame to server
                         let frame = Frame::stream_close(stream_id);
                         send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+                        debug!("Sent StreamClose for stream {}", stream_id);
                     }
                 }
             }
