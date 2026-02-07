@@ -148,6 +148,105 @@ cargo build --release --all-features
 cargo build --profile release-small
 ```
 
+## Docker Deployment
+
+Run Phantom Tunnel in containers for easy deployment anywhere.
+
+### Quick Start with Docker
+
+```bash
+# Build server image
+docker build --target server -t phantom:server .
+
+# Build client image
+docker build --target client -t phantom:client .
+
+# For smaller images (~15MB instead of ~80MB), use Alpine:
+docker build -f Dockerfile.alpine --target server -t phantom:server .
+docker build -f Dockerfile.alpine --target client -t phantom:client .
+```
+
+### Docker Server Setup
+
+1. **Generate keypair:**
+```bash
+docker run --rm phantom:server --generate-key
+```
+
+2. **Create `server.toml`:**
+```toml
+[server]
+listen = "0.0.0.0:443"
+private_key = "YOUR_PRIVATE_KEY"
+public_key = "YOUR_PUBLIC_KEY"
+allowed_clients = ["CLIENT_PUBLIC_KEY"]
+max_connections = 1000
+
+[logging]
+level = "info"
+```
+
+3. **Run server:**
+```bash
+docker run -d \
+  --name phantom-server \
+  --restart unless-stopped \
+  -p 443:443 \
+  -v $(pwd)/server.toml:/app/config.toml:ro \
+  phantom:server
+```
+
+### Docker Client Setup
+
+1. **Generate client keypair:**
+```bash
+docker run --rm phantom:client --generate-key
+```
+
+2. **Create `client.toml`:**
+```toml
+[client]
+server = "YOUR_SERVER_IP:443"
+server_public_key = "SERVER_PUBLIC_KEY"
+private_key = "YOUR_CLIENT_PRIVATE_KEY"
+public_key = "YOUR_CLIENT_PUBLIC_KEY"
+socks5_listen = "0.0.0.0:1080"
+http_listen = "0.0.0.0:8080"
+tls_profile = "chrome"
+enable_padding = true
+
+[logging]
+level = "info"
+```
+
+3. **Run client:**
+```bash
+docker run -d \
+  --name phantom-client \
+  --restart unless-stopped \
+  -p 1080:1080 \
+  -p 8080:8080 \
+  -v $(pwd)/client.toml:/app/config.toml:ro \
+  phantom:client
+```
+
+4. **Configure your browser** to use SOCKS5 proxy at `127.0.0.1:1080`
+
+### Using Docker Compose
+
+```bash
+# Start server
+docker compose up -d server
+
+# Start client
+docker compose up -d client
+
+# View logs
+docker compose logs -f
+```
+
+For more details, see [Docker Documentation](docs/DOCKER.md).
+
 ## Documentation
 
 - [Protocol Specification](docs/PROTOCOL_SPEC.md) - Wire protocol details
