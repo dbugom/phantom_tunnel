@@ -860,13 +860,13 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             // Send success
             stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
 
-            // Relay data bidirectionally
+            // Relay data bidirectionally using spawned tasks for parallel processing
             let (mut client_read, mut client_write) = stream.into_split();
             let stream_id = conn.stream_id;
             let tunnel_clone = Arc::clone(&tunnel);
 
             // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
+            let mut client_to_tunnel = tokio::spawn(async move {
                 let mut buf = vec![0u8; 32768];
                 loop {
                     match client_read.read(&mut buf).await {
@@ -888,7 +888,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             });
 
             // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
+            let mut tunnel_to_client = tokio::spawn(async move {
                 while let Some(data) = conn.data_rx.recv().await {
                     if client_write.write_all(&data).await.is_err() {
                         break;
@@ -897,9 +897,17 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             });
 
             // Wait for either direction to complete
+            // Key insight: We must preserve server->client data, but client->server
+            // can be aborted if server already closed (data has nowhere to go)
             tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
+                _ = &mut client_to_tunnel => {
+                    // Client closed first - wait for server data to fully drain
+                    let _ = tunnel_to_client.await;
+                }
+                _ = &mut tunnel_to_client => {
+                    // Server closed first - safe to abort client read
+                    client_to_tunnel.abort();
+                }
             }
         }
         Err(e) => {
@@ -964,17 +972,17 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
             // Send success
             stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-            // Relay data bidirectionally
+            // Relay data bidirectionally using spawned tasks for parallel processing
             let (mut client_read, mut client_write) = stream.into_split();
             let stream_id = conn.stream_id;
             let tunnel_clone = Arc::clone(&tunnel);
 
             // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
+            let mut client_to_tunnel = tokio::spawn(async move {
                 let mut buf = vec![0u8; 32768];
                 loop {
                     match client_read.read(&mut buf).await {
-                        Ok(0) => break,
+                        Ok(0) => break, // EOF
                         Ok(n) => {
                             let data = bytes::Bytes::copy_from_slice(&buf[..n]);
                             if tunnel_clone.cmd_tx.send(TunnelCommand::SendData {
@@ -991,7 +999,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
             });
 
             // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
+            let mut tunnel_to_client = tokio::spawn(async move {
                 while let Some(data) = conn.data_rx.recv().await {
                     if client_write.write_all(&data).await.is_err() {
                         break;
@@ -999,9 +1007,18 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
                 }
             });
 
+            // Wait for either direction to complete
+            // Key insight: We must preserve server->client data, but client->server
+            // can be aborted if server already closed (data has nowhere to go)
             tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
+                _ = &mut client_to_tunnel => {
+                    // Client closed first - wait for server data to fully drain
+                    let _ = tunnel_to_client.await;
+                }
+                _ = &mut tunnel_to_client => {
+                    // Server closed first - safe to abort client read
+                    client_to_tunnel.abort();
+                }
             }
         }
         Err(e) => {
