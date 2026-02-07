@@ -1,0 +1,91 @@
+# Phantom Tunnel - Alpine-based Minimal Image
+# Produces smaller images (~15MB vs ~80MB for debian)
+#
+# Build server: docker build -f Dockerfile.alpine --target server -t phantom:server .
+# Build client: docker build -f Dockerfile.alpine --target client -t phantom:client .
+
+# ============================================
+# Stage 1: Build environment (musl for static linking)
+# ============================================
+FROM rust:1.75-alpine AS builder
+
+WORKDIR /build
+
+# Install build dependencies
+RUN apk add --no-cache \
+    musl-dev \
+    pkgconfig \
+    openssl-dev \
+    openssl-libs-static
+
+# Copy manifests first for better layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy src to cache dependencies
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/bin/server.rs && \
+    echo "fn main() {}" > src/bin/client.rs && \
+    echo "pub const VERSION: &str = \"0.1.0\";" > src/lib.rs
+
+# Build dependencies
+RUN cargo build --release && rm -rf src target/release/phantom-*
+
+# Copy actual source code
+COPY src ./src
+
+# Build with static linking
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+RUN cargo build --release --bin phantom-server --bin phantom-client
+
+# ============================================
+# Stage 2: Server runtime (minimal)
+# ============================================
+FROM alpine:3.19 AS server
+
+RUN apk add --no-cache ca-certificates libgcc
+
+# Create non-root user
+RUN adduser -D -H -s /sbin/nologin phantom
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/phantom-server /app/
+COPY examples/server.config.toml /app/config.toml
+
+RUN mkdir -p /var/log/phantom_tunnel && \
+    chown phantom:phantom /var/log/phantom_tunnel && \
+    chown -R phantom:phantom /app
+
+USER phantom
+EXPOSE 443
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD pgrep phantom-server || exit 1
+
+ENTRYPOINT ["/app/phantom-server"]
+CMD ["-c", "/app/config.toml"]
+
+# ============================================
+# Stage 3: Client runtime (minimal)
+# ============================================
+FROM alpine:3.19 AS client
+
+RUN apk add --no-cache ca-certificates libgcc
+
+RUN adduser -D -H -s /sbin/nologin phantom
+
+WORKDIR /app
+
+COPY --from=builder /build/target/release/phantom-client /app/
+COPY examples/client.config.toml /app/config.toml
+
+RUN chown -R phantom:phantom /app
+
+USER phantom
+EXPOSE 1080 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
+    CMD pgrep phantom-client || exit 1
+
+ENTRYPOINT ["/app/phantom-client"]
+CMD ["-c", "/app/config.toml"]

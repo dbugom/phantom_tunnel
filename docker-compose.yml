@@ -1,0 +1,64 @@
+# Phantom Tunnel - Docker Compose Configuration
+#
+# Usage:
+#   Server: docker compose up server
+#   Client: docker compose up client
+#   Both:   docker compose up
+#
+# Build:
+#   docker compose build
+
+version: '3.8'
+
+services:
+  # ============================================
+  # Phantom Tunnel Server
+  # ============================================
+  server:
+    build:
+      context: .
+      target: server
+    image: phantom-tunnel:server
+    container_name: phantom-server
+    restart: unless-stopped
+    ports:
+      - "443:443"
+    volumes:
+      # Mount your server config (required)
+      - ./server.toml:/app/config.toml:ro
+      # Optional: persist logs
+      - phantom-server-logs:/var/log/phantom_tunnel
+    environment:
+      - RUST_LOG=info
+    # For production, consider these security options:
+    # security_opt:
+    #   - no-new-privileges:true
+    # read_only: true
+
+  # ============================================
+  # Phantom Tunnel Client
+  # ============================================
+  client:
+    build:
+      context: .
+      target: client
+    image: phantom-tunnel:client
+    container_name: phantom-client
+    restart: unless-stopped
+    ports:
+      # SOCKS5 proxy
+      - "1080:1080"
+      # HTTP proxy
+      - "8080:8080"
+    volumes:
+      # Mount your client config (required)
+      - ./client.toml:/app/config.toml:ro
+    environment:
+      - RUST_LOG=info
+    # Only start client after server is healthy (if running both)
+    # depends_on:
+    #   server:
+    #     condition: service_healthy
+
+volumes:
+  phantom-server-logs:

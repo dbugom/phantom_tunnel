@@ -1,0 +1,41 @@
+# Build artifacts
+target/
+debug/
+release/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Documentation (not needed in container)
+docs/
+*.md
+!README.md
+
+# Test files
+tests/
+benches/
+
+# Local configs (use mounted volumes instead)
+*.toml
+!Cargo.toml
+!examples/*.toml
+
+# Logs
+*.log
+logs/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker files (avoid recursive context)
+docker-compose*.yml
+Dockerfile*
+.dockerignore
