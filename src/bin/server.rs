@@ -15,11 +15,15 @@ use phantom_tunnel::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, Semaphore};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Grace period for draining streams before full removal
+const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Phantom Tunnel Server - Secure, censorship-resistant tunnel
 #[derive(Parser, Debug)]
@@ -65,6 +69,8 @@ enum StreamToTunnel {
 /// Active stream with channel to send data to it
 struct ActiveStream {
     data_tx: mpsc::Sender<bytes::Bytes>,
+    /// If Some, the stream is draining (closed by client, waiting for cleanup)
+    draining_since: Option<Instant>,
 }
 
 #[tokio::main]
@@ -291,11 +297,38 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
     // Channel for stream tasks to send data back through tunnel
     let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<StreamToTunnel>(256);
 
-    // Buffer for decryption
+    // Buffer for decryption (reused to avoid allocations)
     let mut frame_buf = vec![0u8; 65536];
+
+    // Reusable encryption buffer
+    let mut encrypt_buf = vec![0u8; 65536 + 16];
+
+    // Interval for cleaning up expired draining streams
+    let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
+    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
+            // Periodic cleanup of expired draining streams
+            _ = cleanup_interval.tick() => {
+                let now = Instant::now();
+                let expired: Vec<u32> = active_streams
+                    .iter()
+                    .filter_map(|(&id, stream)| {
+                        if let Some(drain_start) = stream.draining_since {
+                            if now.duration_since(drain_start) >= STREAM_DRAIN_TIMEOUT {
+                                return Some(id);
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                for stream_id in expired {
+                    trace!("Removing expired draining stream {}", stream_id);
+                    active_streams.remove(&stream_id);
+                }
+            }
             // Receive frames from reader task
             Some(msg) = reader_rx.recv() => {
                 match msg {
@@ -334,7 +367,10 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
 
                                         // Create channel for sending data to this stream
                                         let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(256);
-                                        active_streams.insert(stream_id, ActiveStream { data_tx });
+                                        active_streams.insert(stream_id, ActiveStream {
+                                            data_tx,
+                                            draining_since: None,
+                                        });
 
                                         // Spawn task to connect to destination and relay data
                                         let tunnel_tx = tunnel_tx.clone();
@@ -354,17 +390,30 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                                 // Forward data to appropriate stream handler
                                 let stream_id = frame.stream_id;
                                 if let Some(active) = active_streams.get(&stream_id) {
-                                    if active.data_tx.send(frame.payload).await.is_err() {
-                                        // Stream handler closed, remove it
-                                        active_streams.remove(&stream_id);
+                                    if active.draining_since.is_some() {
+                                        // Stream is draining - silently drop
+                                        trace!("Dropping data for draining stream {}", stream_id);
+                                    } else if active.data_tx.send(frame.payload).await.is_err() {
+                                        // Stream handler closed - mark as draining instead of removing
+                                        debug!("Stream {} handler closed, marking as draining", stream_id);
+                                        if let Some(stream) = active_streams.get_mut(&stream_id) {
+                                            stream.draining_since = Some(Instant::now());
+                                        }
                                     }
+                                } else {
+                                    // Unknown stream - likely already cleaned up
+                                    trace!("Received data for unknown stream {}", stream_id);
                                 }
                             }
                             FrameType::StreamClose => {
-                                // Remove stream
+                                // Client closed stream - mark as draining if not already
                                 let stream_id = frame.stream_id;
                                 debug!("Client closed stream {}", stream_id);
-                                active_streams.remove(&stream_id);
+                                if let Some(stream) = active_streams.get_mut(&stream_id) {
+                                    if stream.draining_since.is_none() {
+                                        stream.draining_since = Some(Instant::now());
+                                    }
+                                }
                                 let _ = mux.handle_frame(frame).await;
                             }
                             _ => {
@@ -388,15 +437,28 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
             Some(cmd) = tunnel_rx.recv() => {
                 match cmd {
                     StreamToTunnel::Data { stream_id, data } => {
-                        // Send data frame to client
-                        let frame = Frame::data(stream_id, data);
-                        send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+                        // Only send if stream is not draining
+                        let is_draining = active_streams
+                            .get(&stream_id)
+                            .map(|s| s.draining_since.is_some())
+                            .unwrap_or(true);
+
+                        if !is_draining {
+                            let frame = Frame::data(stream_id, data);
+                            send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                        } else {
+                            trace!("Dropping outbound data for draining stream {}", stream_id);
+                        }
                     }
                     StreamToTunnel::Close { stream_id } => {
-                        // Send close frame to client
-                        active_streams.remove(&stream_id);
+                        // Mark as draining and send close frame
+                        if let Some(stream) = active_streams.get_mut(&stream_id) {
+                            if stream.draining_since.is_none() {
+                                stream.draining_since = Some(Instant::now());
+                            }
+                        }
                         let frame = Frame::stream_close(stream_id);
-                        send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+                        send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
                     }
                 }
             }
@@ -409,7 +471,15 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
 
         // Send any queued frames from multiplexer
         for frame in mux.take_send_queue() {
-            send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+            // Don't send frames for draining streams
+            let is_draining = active_streams
+                .get(&frame.stream_id)
+                .map(|s| s.draining_since.is_some())
+                .unwrap_or(false);
+
+            if !is_draining {
+                send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+            }
         }
     }
 
@@ -507,6 +577,7 @@ async fn perform_handshake(
 }
 
 /// Send an encrypted frame using split write half
+#[allow(dead_code)]
 async fn send_frame_write(
     write_half: &mut OwnedWriteHalf,
     noise: &mut NoiseTransport,
@@ -525,6 +596,35 @@ async fn send_frame_write(
     let len_bytes = (ct_len as u16).to_be_bytes();
     write_half.write_all(&len_bytes).await?;
     write_half.write_all(&ciphertext[..ct_len]).await?;
+
+    Ok(())
+}
+
+/// Send an encrypted frame with reusable buffer (reduces allocations)
+async fn send_frame_write_buffered(
+    write_half: &mut OwnedWriteHalf,
+    noise: &mut NoiseTransport,
+    frame: &Frame,
+    encrypt_buf: &mut Vec<u8>,
+) -> Result<()> {
+    let plaintext = frame.encode();
+
+    // Ensure buffer is large enough
+    let needed = plaintext.len() + 16;
+    if encrypt_buf.len() < needed {
+        encrypt_buf.resize(needed, 0);
+    }
+
+    let ct_len = noise
+        .encrypt(&plaintext, encrypt_buf)
+        .context("Failed to encrypt frame")?;
+
+    trace!("Sending frame type {:?} stream {} ({} bytes encrypted)",
+           frame.frame_type, frame.stream_id, ct_len);
+
+    let len_bytes = (ct_len as u16).to_be_bytes();
+    write_half.write_all(&len_bytes).await?;
+    write_half.write_all(&encrypt_buf[..ct_len]).await?;
 
     Ok(())
 }
