@@ -234,6 +234,9 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
         .await
         .context("Failed to acquire connection permit")?;
 
+    // Disable Nagle's algorithm to avoid delays on small writes (control frames, length prefixes)
+    stream.set_nodelay(true)?;
+
     // Split stream for handshake
     let (mut read_half, mut write_half) = stream.into_split();
 
@@ -622,9 +625,12 @@ async fn send_frame_write_buffered(
     trace!("Sending frame type {:?} stream {} ({} bytes encrypted)",
            frame.frame_type, frame.stream_id, ct_len);
 
+    // Coalesce length prefix + ciphertext into a single write to halve syscall overhead
     let len_bytes = (ct_len as u16).to_be_bytes();
-    write_half.write_all(&len_bytes).await?;
-    write_half.write_all(&encrypt_buf[..ct_len]).await?;
+    let mut wire_buf = Vec::with_capacity(2 + ct_len);
+    wire_buf.extend_from_slice(&len_bytes);
+    wire_buf.extend_from_slice(&encrypt_buf[..ct_len]);
+    write_half.write_all(&wire_buf).await?;
 
     Ok(())
 }
@@ -663,6 +669,8 @@ async fn handle_stream(
     // Connect to destination
     let target = match TcpStream::connect(&destination).await {
         Ok(t) => {
+            // Disable Nagle's algorithm on destination connection too
+            let _ = t.set_nodelay(true);
             info!("Stream {} connected to {}", stream_id, destination);
             t
         }
@@ -679,7 +687,7 @@ async fn handle_stream(
 
     // Task to read from target and send to tunnel
     let target_to_tunnel = tokio::spawn(async move {
-        let mut buf = vec![0u8; 32768];
+        let mut buf = vec![0u8; 65536];
         loop {
             match target_read.read(&mut buf).await {
                 Ok(0) => {

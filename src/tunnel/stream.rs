@@ -80,6 +80,16 @@ impl TunnelStream {
         matches!(self.state, StreamState::Open | StreamState::HalfClosedLocal)
     }
 
+    /// Get current receive window size
+    pub fn recv_window(&self) -> u32 {
+        self.recv_window
+    }
+
+    /// Consume receive window without buffering data
+    pub fn consume_recv_window(&mut self, amount: u32) {
+        self.recv_window -= amount;
+    }
+
     /// Update send window
     pub fn update_send_window(&mut self, increment: u32) {
         self.send_window = self.send_window.saturating_add(increment);

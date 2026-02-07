@@ -14,7 +14,7 @@ use phantom_tunnel::{
     obfuscation::BrowserProfile,
     tunnel::{Frame, FrameType, Multiplexer},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -24,7 +24,8 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
 /// Grace period for draining streams before full removal (allows in-flight data to arrive)
-const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Reduced from 5s to 1s to prevent file descriptor exhaustion under heavy load
+const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Phantom Tunnel Client - Secure, censorship-resistant tunnel
 #[derive(Parser, Debug)]
@@ -313,7 +314,7 @@ fn generate_keypair() -> Result<()> {
 /// Active stream state in the tunnel
 struct ActiveStream {
     data_tx: mpsc::Sender<bytes::Bytes>,
-    /// If Some, the stream is draining (closed locally, waiting for server close or timeout)
+    /// If Some, the stream is draining (closed by client, waiting for cleanup)
     draining_since: Option<Instant>,
 }
 
@@ -336,6 +337,9 @@ async fn run_tunnel(
     let stream = TcpStream::connect(&state.server_addr)
         .await
         .context("Failed to connect to server")?;
+
+    // Disable Nagle's algorithm to avoid delays on small writes (control frames, length prefixes)
+    stream.set_nodelay(true)?;
 
     info!("Connected to server, performing handshake...");
 
@@ -756,9 +760,12 @@ async fn send_frame_write_buffered(
     trace!("Sending frame type {:?} stream {} ({} bytes encrypted)",
            frame.frame_type, frame.stream_id, ct_len);
 
+    // Coalesce length prefix + ciphertext into a single write to halve syscall overhead
     let len_bytes = (ct_len as u16).to_be_bytes();
-    write_half.write_all(&len_bytes).await?;
-    write_half.write_all(&encrypt_buf[..ct_len]).await?;
+    let mut wire_buf = Vec::with_capacity(2 + ct_len);
+    wire_buf.extend_from_slice(&len_bytes);
+    wire_buf.extend_from_slice(&encrypt_buf[..ct_len]);
+    write_half.write_all(&wire_buf).await?;
 
     Ok(())
 }
@@ -867,7 +874,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 32768];
+                let mut buf = vec![0u8; 65536];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break, // EOF
@@ -971,7 +978,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 32768];
+                let mut buf = vec![0u8; 65536];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break,

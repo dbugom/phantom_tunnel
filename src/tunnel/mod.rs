@@ -44,5 +44,7 @@ pub enum TunnelError {
 /// Maximum number of concurrent streams
 pub const MAX_STREAMS: u32 = 1024;
 
-/// Default window size for flow control (256 KB)
-pub const DEFAULT_WINDOW_SIZE: u32 = 262144;
+/// Default window size for flow control (4 MB)
+/// Larger window allows higher throughput over high-RTT links:
+/// 4MB / 100ms RTT = 40 MB/s ≈ 320 Mbps theoretical max
+pub const DEFAULT_WINDOW_SIZE: u32 = 4_194_304;
