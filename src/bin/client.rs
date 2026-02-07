@@ -866,7 +866,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             let tunnel_clone = Arc::clone(&tunnel);
 
             // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
+            let mut client_to_tunnel = tokio::spawn(async move {
                 let mut buf = vec![0u8; 32768];
                 loop {
                     match client_read.read(&mut buf).await {
@@ -888,7 +888,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             });
 
             // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
+            let mut tunnel_to_client = tokio::spawn(async move {
                 while let Some(data) = conn.data_rx.recv().await {
                     if client_write.write_all(&data).await.is_err() {
                         break;
@@ -896,10 +896,15 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
                 }
             });
 
-            // Wait for either direction to complete
+            // Wait for either direction to complete, then abort the other
+            // This prevents file descriptor leaks from orphaned tasks
             tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
+                _ = &mut client_to_tunnel => {
+                    tunnel_to_client.abort();
+                }
+                _ = &mut tunnel_to_client => {
+                    client_to_tunnel.abort();
+                }
             }
         }
         Err(e) => {
@@ -970,7 +975,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
             let tunnel_clone = Arc::clone(&tunnel);
 
             // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
+            let mut client_to_tunnel = tokio::spawn(async move {
                 let mut buf = vec![0u8; 32768];
                 loop {
                     match client_read.read(&mut buf).await {
@@ -991,7 +996,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
             });
 
             // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
+            let mut tunnel_to_client = tokio::spawn(async move {
                 while let Some(data) = conn.data_rx.recv().await {
                     if client_write.write_all(&data).await.is_err() {
                         break;
@@ -999,9 +1004,15 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
                 }
             });
 
+            // Wait for either direction to complete, then abort the other
+            // This prevents file descriptor leaks from orphaned tasks
             tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
+                _ = &mut client_to_tunnel => {
+                    tunnel_to_client.abort();
+                }
+                _ = &mut tunnel_to_client => {
+                    client_to_tunnel.abort();
+                }
             }
         }
         Err(e) => {
