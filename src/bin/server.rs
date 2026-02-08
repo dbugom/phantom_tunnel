@@ -569,7 +569,7 @@ where
                 .map(|s| s.draining_since.is_some())
                 .unwrap_or(false);
 
-            if !is_draining {
+            if !is_draining || frame.frame_type == FrameType::StreamClose {
                 send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
             }
         }
@@ -784,7 +784,7 @@ async fn handle_stream(
     let tunnel_tx_clone = tunnel_tx.clone();
 
     // Task to read from target and send to tunnel
-    let target_to_tunnel = tokio::spawn(async move {
+    let mut target_to_tunnel = tokio::spawn(async move {
         // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
         let mut buf = vec![0u8; 65512];
         loop {
@@ -810,7 +810,7 @@ async fn handle_stream(
     });
 
     // Task to read from tunnel and send to target
-    let tunnel_to_target = tokio::spawn(async move {
+    let mut tunnel_to_target = tokio::spawn(async move {
         while let Some(data) = data_rx.recv().await {
             if target_write.write_all(&data).await.is_err() {
                 break;
@@ -818,10 +818,14 @@ async fn handle_stream(
         }
     });
 
-    // Wait for either direction to complete
+    // Wait for either direction to complete, then abort the other
     tokio::select! {
-        _ = target_to_tunnel => {}
-        _ = tunnel_to_target => {}
+        _ = &mut target_to_tunnel => {
+            tunnel_to_target.abort();
+        }
+        _ = &mut tunnel_to_target => {
+            target_to_tunnel.abort();
+        }
     }
 
     Ok(())

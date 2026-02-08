@@ -450,6 +450,9 @@ where
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Track stream IDs for which we've already sent STREAM_CLOSE to avoid duplicates
+    let mut closed_streams_notified: HashSet<u32> = HashSet::new();
+
     loop {
         tokio::select! {
             // Periodic cleanup of expired draining streams
@@ -472,6 +475,12 @@ where
                     active_streams.remove(&stream_id);
                     // Also remove from multiplexer to free the stream slot
                     mux.remove_stream(stream_id);
+                }
+
+                // Prune closed_streams_notified to prevent unbounded growth
+                // Keep only entries for streams that are still being referenced
+                if closed_streams_notified.len() > 1000 {
+                    closed_streams_notified.clear();
                 }
             }
             // Receive frames from reader task
@@ -511,9 +520,14 @@ where
                                         }
                                     }
                                 } else {
-                                    // Truly unknown stream - this is unusual
+                                    // Truly unknown stream - tell the server to stop sending
                                     debug!("Received data for unknown stream {} ({} bytes)",
                                            frame.stream_id, frame.payload.len());
+                                    if closed_streams_notified.insert(frame.stream_id) {
+                                        let close_frame = Frame::stream_close(frame.stream_id);
+                                        send_frame_write_buffered(&mut write_half, &mut noise_transport, &close_frame, &mut encrypt_buf).await?;
+                                        write_half.flush().await?;
+                                    }
                                 }
                             } else if frame.frame_type == FrameType::StreamClose {
                                 debug!("Server closed stream {}", frame.stream_id);
@@ -650,7 +664,7 @@ where
                 .map(|s| s.draining_since.is_some())
                 .unwrap_or(false);
 
-            if !is_draining {
+            if !is_draining || frame.frame_type == FrameType::StreamClose {
                 send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
             }
         }
