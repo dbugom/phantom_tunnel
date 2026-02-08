@@ -157,7 +157,11 @@ async fn main() -> Result<()> {
             let key = load_private_key(&key_path)
                 .context("Failed to load TLS private key")?;
 
-            let tls_config = rustls::ServerConfig::builder()
+            let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                    rustls::crypto::ring::default_provider(),
+                ))
+                .with_safe_default_protocol_versions()
+                .context("Failed to set TLS protocol versions")?
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
                 .context("Failed to build TLS server config")?;
