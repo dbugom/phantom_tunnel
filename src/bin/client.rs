@@ -752,6 +752,7 @@ where
     let len_bytes = (len as u16).to_be_bytes();
     write_half.write_all(&len_bytes).await?;
     write_half.write_all(&buf[..len]).await?;
+    write_half.flush().await?;
 
     // Read response (<- e, ee, se)
     let mut len_buf = [0u8; 2];

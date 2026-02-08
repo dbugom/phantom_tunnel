@@ -622,6 +622,7 @@ where
     let len_bytes = (len as u16).to_be_bytes();
     write_half.write_all(&len_bytes).await?;
     write_half.write_all(&buf[..len]).await?;
+    write_half.flush().await?;
 
     // Convert to transport mode
     let noise_transport = handshake
