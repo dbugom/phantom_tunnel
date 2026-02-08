@@ -11,7 +11,7 @@ categories = ["network-programming", "cryptography"]
 
 [features]
 default = ["tls", "socks5", "http-proxy"]
-tls = ["rustls", "tokio-rustls", "webpki-roots"]
+tls = ["rustls", "tokio-rustls", "webpki-roots", "rustls-pemfile"]
 socks5 = []
 http-proxy = ["hyper", "http-body-util"]
 dns-tunnel = ["hickory-resolver", "hickory-proto"]
@@ -41,6 +41,7 @@ rand = "0.8"
 rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", optional = true }
 webpki-roots = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2.0", optional = true }
 
 # QUIC (optional - use as secondary transport, QUIC is targeted by GFW)
 quinn = { version = "0.11", optional = true }

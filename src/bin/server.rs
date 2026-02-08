@@ -16,9 +16,8 @@ use phantom_tunnel::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
@@ -150,6 +149,28 @@ async fn main() -> Result<()> {
         conn_semaphore: Semaphore::new(server_config.max_connections),
     });
 
+    // Build TLS acceptor if cert/key are configured
+    let tls_acceptor = match (server_config.tls_cert, server_config.tls_key) {
+        (Some(cert_path), Some(key_path)) => {
+            let certs = load_certs(&cert_path)
+                .context("Failed to load TLS certificate")?;
+            let key = load_private_key(&key_path)
+                .context("Failed to load TLS private key")?;
+
+            let tls_config = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(certs, key)
+                .context("Failed to build TLS server config")?;
+
+            info!("TLS enabled with cert: {}", cert_path);
+            Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))))
+        }
+        _ => {
+            info!("TLS disabled (no tls_cert/tls_key configured)");
+            None
+        }
+    };
+
     // Determine listen address
     let listen_addr = args.listen.unwrap_or(server_config.listen);
 
@@ -171,8 +192,9 @@ async fn main() -> Result<()> {
                         debug!("New connection from {}", peer_addr);
 
                         let state = Arc::clone(&state);
+                        let acceptor = tls_acceptor.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, state).await {
+                            if let Err(e) = handle_connection(stream, state, acceptor).await {
                                 debug!("Connection error: {}", e);
                             }
                         });
@@ -190,6 +212,33 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Load TLS certificate chain from PEM file
+fn load_certs(path: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let mut file = std::io::BufReader::new(
+        std::fs::File::open(path)
+            .context(format!("Failed to open cert file: {}", path))?
+    );
+    let certs: Vec<_> = rustls_pemfile::certs(&mut file)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to parse PEM certificates")?;
+    if certs.is_empty() {
+        return Err(anyhow!("No certificates found in {}", path));
+    }
+    info!("Loaded {} certificate(s) from {}", certs.len(), path);
+    Ok(certs)
+}
+
+/// Load TLS private key from PEM file
+fn load_private_key(path: &str) -> Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let mut file = std::io::BufReader::new(
+        std::fs::File::open(path)
+            .context(format!("Failed to open key file: {}", path))?
+    );
+    rustls_pemfile::private_key(&mut file)
+        .context("Failed to parse PEM private key")?
+        .ok_or_else(|| anyhow!("No private key found in {}", path))
 }
 
 /// Generate and print a new keypair
@@ -226,8 +275,13 @@ enum ReaderMessage {
 }
 
 /// Handle a single client connection
-async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result<()> {
-    // Acquire connection permit
+async fn handle_connection(
+    stream: TcpStream,
+    state: Arc<ServerState>,
+    tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+) -> Result<()> {
+    // Acquire connection permit (clone Arc first so we can move state into inner fn)
+    let inner_state = Arc::clone(&state);
     let _permit = state
         .conn_semaphore
         .acquire()
@@ -237,9 +291,32 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
     // Disable Nagle's algorithm to avoid delays on small writes (control frames, length prefixes)
     stream.set_nodelay(true)?;
 
-    // Split stream for handshake
-    let (mut read_half, mut write_half) = stream.into_split();
+    if let Some(acceptor) = tls_acceptor {
+        // TLS wrapping enabled
+        let tls_stream = acceptor.accept(stream)
+            .await
+            .context("TLS accept failed")?;
+        debug!("TLS handshake complete with client");
 
+        let (read_half, write_half) = tokio::io::split(tls_stream);
+        handle_connection_inner(read_half, write_half, inner_state).await
+    } else {
+        // Raw TCP (backward compat)
+        let (read_half, write_half) = stream.into_split();
+        handle_connection_inner(read_half, write_half, inner_state).await
+    }
+}
+
+/// Inner connection handler, generic over transport read/write halves
+async fn handle_connection_inner<R, W>(
+    mut read_half: R,
+    mut write_half: W,
+    state: Arc<ServerState>,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     // Perform Noise handshake
     let (mut noise_transport, client_public) =
         perform_handshake_split(&mut read_half, &mut write_half, &state.keypair).await?;
@@ -492,11 +569,15 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
 }
 
 /// Perform Noise IK handshake with split streams
-async fn perform_handshake_split(
-    read_half: &mut OwnedReadHalf,
-    write_half: &mut OwnedWriteHalf,
+async fn perform_handshake_split<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
     keypair: &KeyPair,
-) -> Result<(NoiseTransport, PublicKey)> {
+) -> Result<(NoiseTransport, PublicKey)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut handshake = NoiseHandshake::new_responder(keypair)
         .context("Failed to create handshake")?;
 
@@ -583,8 +664,8 @@ async fn perform_handshake(
 
 /// Send an encrypted frame using split write half
 #[allow(dead_code)]
-async fn send_frame_write(
-    write_half: &mut OwnedWriteHalf,
+async fn send_frame_write<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
     noise: &mut NoiseTransport,
     frame: &Frame,
 ) -> Result<()> {
@@ -606,8 +687,8 @@ async fn send_frame_write(
 }
 
 /// Send an encrypted frame with reusable buffer (reduces allocations)
-async fn send_frame_write_buffered(
-    write_half: &mut OwnedWriteHalf,
+async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
     noise: &mut NoiseTransport,
     frame: &Frame,
     encrypt_buf: &mut Vec<u8>,

@@ -17,9 +17,8 @@ use phantom_tunnel::{
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, trace, warn};
 
@@ -72,9 +71,8 @@ struct ClientState {
     server_addr: String,
     /// Browser profile
     profile: BrowserProfile,
-    /// SNI for TLS (reserved for future TLS transport)
-    #[allow(dead_code)]
-    sni: String,
+    /// SNI for TLS wrapping (None = raw TCP, Some = TLS wrapping enabled)
+    tls_sni: Option<String>,
 }
 
 /// Request to open a new stream through the tunnel
@@ -211,12 +209,17 @@ async fn main() -> Result<()> {
         server_public,
         server_addr: args.server.unwrap_or(client_config.server),
         profile,
-        sni: client_config.tls_sni.unwrap_or_else(|| "www.google.com".to_string()),
+        tls_sni: client_config.tls_sni,
     });
 
     info!("Phantom Tunnel Client v{}", phantom_tunnel::VERSION);
     info!("Server: {}", state.server_addr);
     info!("Browser profile: {:?}", state.profile);
+    if let Some(ref sni) = state.tls_sni {
+        info!("TLS wrapping enabled, SNI: {}", sni);
+    } else {
+        info!("TLS wrapping disabled (raw TCP)");
+    }
     info!("Client public key: {}...", &state.keypair.public.to_base64()[..16]);
 
     // Start local proxies
@@ -331,7 +334,7 @@ enum ReaderMessage {
 /// Run the tunnel connection to server
 async fn run_tunnel(
     state: Arc<ClientState>,
-    mut cmd_rx: mpsc::Receiver<TunnelCommand>,
+    cmd_rx: mpsc::Receiver<TunnelCommand>,
 ) -> Result<()> {
     // Connect to server
     let stream = TcpStream::connect(&state.server_addr)
@@ -343,9 +346,41 @@ async fn run_tunnel(
 
     info!("Connected to server, performing handshake...");
 
-    // Split stream for handshake (we'll need both halves)
-    let (mut read_half, mut write_half) = stream.into_split();
+    // Wrap in TLS if configured, otherwise use raw TCP
+    if let Some(ref sni) = state.tls_sni {
+        // TLS wrapping enabled
+        let tls_config = phantom_tunnel::obfuscation::build_tls_config(
+            &phantom_tunnel::obfuscation::FingerprintConfig::new(state.profile, sni),
+        ).context("Failed to build TLS config")?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let server_name = rustls::pki_types::ServerName::try_from(sni.clone())
+            .map_err(|e| anyhow!("Invalid SNI '{}': {}", sni, e))?;
+        let tls_stream = connector.connect(server_name, stream)
+            .await
+            .context("TLS handshake failed")?;
 
+        info!("TLS handshake complete (SNI: {})", sni);
+
+        let (read_half, write_half) = tokio::io::split(tls_stream);
+        run_tunnel_inner(state, cmd_rx, read_half, write_half).await
+    } else {
+        // Raw TCP (backward compat)
+        let (read_half, write_half) = stream.into_split();
+        run_tunnel_inner(state, cmd_rx, read_half, write_half).await
+    }
+}
+
+/// Inner tunnel loop, generic over the transport read/write halves
+async fn run_tunnel_inner<R, W>(
+    state: Arc<ClientState>,
+    mut cmd_rx: mpsc::Receiver<TunnelCommand>,
+    mut read_half: R,
+    mut write_half: W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     // Perform Noise handshake using both halves
     let mut noise_transport = match perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &state.server_public).await {
         Ok(transport) => transport,
@@ -675,12 +710,16 @@ async fn send_frame(
 }
 
 /// Perform Noise IK handshake with split streams
-async fn perform_handshake_split(
-    read_half: &mut OwnedReadHalf,
-    write_half: &mut OwnedWriteHalf,
+async fn perform_handshake_split<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
     keypair: &KeyPair,
     server_public: &PublicKey,
-) -> Result<NoiseTransport> {
+) -> Result<NoiseTransport>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut handshake = NoiseHandshake::new_initiator(keypair, server_public)
         .context("Failed to create handshake")?;
 
@@ -717,8 +756,8 @@ async fn perform_handshake_split(
 
 /// Send an encrypted frame using write half
 #[allow(dead_code)]
-async fn send_frame_write(
-    write_half: &mut OwnedWriteHalf,
+async fn send_frame_write<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
     noise: &mut NoiseTransport,
     frame: &Frame,
 ) -> Result<()> {
@@ -740,8 +779,8 @@ async fn send_frame_write(
 }
 
 /// Send an encrypted frame using write half with reusable buffer (reduces allocations)
-async fn send_frame_write_buffered(
-    write_half: &mut OwnedWriteHalf,
+async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
     noise: &mut NoiseTransport,
     frame: &Frame,
     encrypt_buf: &mut Vec<u8>,
