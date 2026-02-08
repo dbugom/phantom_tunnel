@@ -375,12 +375,16 @@ async fn run_tunnel_inner<R, W>(
     state: Arc<ClientState>,
     mut cmd_rx: mpsc::Receiver<TunnelCommand>,
     mut read_half: R,
-    mut write_half: W,
+    write_half: W,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // Wrap writer in BufWriter to coalesce small writes into fewer TLS records
+    // (each raw write_all on a TLS stream creates a separate TLS record with 5+16 bytes overhead)
+    let mut write_half = tokio::io::BufWriter::new(write_half);
+
     // Perform Noise handshake using both halves
     let mut noise_transport = match perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &state.server_public).await {
         Ok(transport) => transport,
@@ -563,6 +567,13 @@ where
                                         break;
                                     }
                                 }
+                                // Flush to ensure STREAM_OPEN is sent immediately
+                                if !send_failed {
+                                    if let Err(e) = write_half.flush().await {
+                                        error!("Failed to flush STREAM_OPEN: {}", e);
+                                        send_failed = true;
+                                    }
+                                }
 
                                 if send_failed {
                                     let _ = req.response_tx.send(Err("Failed to send stream open".to_string()));
@@ -602,6 +613,7 @@ where
                         if !is_draining {
                             let frame = Frame::data(stream_id, data);
                             send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                            write_half.flush().await?;
                         } else {
                             trace!("Dropping send for draining/unknown stream {}", stream_id);
                         }
@@ -629,7 +641,9 @@ where
         }
 
         // Send queued frames from multiplexer (e.g., WindowUpdate)
-        for frame in mux.take_send_queue() {
+        let queued_frames = mux.take_send_queue();
+        let has_queued = !queued_frames.is_empty();
+        for frame in queued_frames {
             // Don't send frames for draining streams
             let is_draining = active_streams
                 .get(&frame.stream_id)
@@ -639,6 +653,10 @@ where
             if !is_draining {
                 send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
             }
+        }
+        // Flush all buffered writes as a single batch
+        if has_queued {
+            write_half.flush().await?;
         }
     }
 

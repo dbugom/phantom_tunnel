@@ -314,13 +314,16 @@ async fn handle_connection(
 /// Inner connection handler, generic over transport read/write halves
 async fn handle_connection_inner<R, W>(
     mut read_half: R,
-    mut write_half: W,
+    write_half: W,
     state: Arc<ServerState>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
+    // Wrap writer in BufWriter to coalesce small writes into fewer TLS records
+    let mut write_half = tokio::io::BufWriter::new(write_half);
+
     // Perform Noise handshake
     let (mut noise_transport, client_public) =
         perform_handshake_split(&mut read_half, &mut write_half, &state.keypair).await?;
@@ -532,6 +535,7 @@ where
                         if !is_draining {
                             let frame = Frame::data(stream_id, data);
                             send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                            write_half.flush().await?;
                         } else {
                             trace!("Dropping outbound data for draining stream {}", stream_id);
                         }
@@ -556,7 +560,9 @@ where
         }
 
         // Send any queued frames from multiplexer
-        for frame in mux.take_send_queue() {
+        let queued_frames = mux.take_send_queue();
+        let has_queued = !queued_frames.is_empty();
+        for frame in queued_frames {
             // Don't send frames for draining streams
             let is_draining = active_streams
                 .get(&frame.stream_id)
@@ -566,6 +572,10 @@ where
             if !is_draining {
                 send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
             }
+        }
+        // Flush all buffered writes as a single batch
+        if has_queued {
+            write_half.flush().await?;
         }
     }
 
