@@ -1,0 +1,97 @@
+name: MikroTik Container Build
+
+on:
+  push:
+    branches:
+      - feature/mikrotik-container
+    tags:
+      - 'v*'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile.mikrotik'
+      - 'mikrotik/**'
+      - '.github/workflows/mikrotik-build.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [arm64, armv7, amd64]
+        include:
+          - arch: arm64
+            platform: linux/arm64
+          - arch: armv7
+            platform: linux/arm/v7
+          - arch: amd64
+            platform: linux/amd64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build container image
+        run: |
+          docker buildx build \
+            --file Dockerfile.mikrotik \
+            --platform ${{ matrix.platform }} \
+            --tag phantom-client:${{ matrix.arch }} \
+            --output "type=docker,dest=phantom-client-${{ matrix.arch }}.tar" \
+            .
+
+      - name: Verify tar format
+        run: |
+          echo "=== Archive contents ==="
+          tar tf phantom-client-${{ matrix.arch }}.tar | head -20
+          echo "=== Archive size ==="
+          ls -lh phantom-client-${{ matrix.arch }}.tar
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: phantom-client-${{ matrix.arch }}
+          path: phantom-client-${{ matrix.arch }}.tar
+          retention-days: 30
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/phantom-client-arm64/phantom-client-arm64.tar
+            artifacts/phantom-client-armv7/phantom-client-armv7.tar
+            artifacts/phantom-client-amd64/phantom-client-amd64.tar
+          body: |
+            ## MikroTik Container Images
+
+            Download the `.tar` file matching your MikroTik device architecture:
+
+            | Device | Architecture | File |
+            |---|---|---|
+            | RB5009, CCR2004, hAP ax² | ARM64 | `phantom-client-arm64.tar` |
+            | hAP ac³, RB4011 | ARMv7 | `phantom-client-armv7.tar` |
+            | CHR, x86 | AMD64 | `phantom-client-amd64.tar` |
+
+            See [docs/MIKROTIK.md](docs/MIKROTIK.md) for setup instructions.
+          generate_release_notes: true

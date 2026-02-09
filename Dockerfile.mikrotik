@@ -1,0 +1,96 @@
+# Phantom Tunnel Client - MikroTik Container Image
+# Produces a minimal (~5-7MB) Docker-format image compatible with MikroTik RouterOS 7.4+
+#
+# Build with: ./mikrotik/build.sh [arm64|armv7|amd64]
+# Or directly: docker buildx build -f Dockerfile.mikrotik --platform linux/arm64 -t phantom-client:arm64 .
+
+# --- Stage 1: Cross-compile static binary ---
+FROM --platform=$BUILDPLATFORM rust:1.83-bookworm AS builder
+
+ARG TARGETPLATFORM
+ARG BUILDPLATFORM
+
+# Install cross-compilation toolchains from musl.cc
+# These provide the C compiler needed by the `ring` crate's C/ASM code
+RUN case "$TARGETPLATFORM" in \
+        "linux/arm64")   MUSL_TARGET="aarch64-linux-musl" ;; \
+        "linux/arm/v7")  MUSL_TARGET="armv7l-linux-musleabihf" ;; \
+        "linux/amd64")   MUSL_TARGET="x86_64-linux-musl" ;; \
+        *) echo "Unsupported platform: $TARGETPLATFORM" && exit 1 ;; \
+    esac && \
+    curl -fsSL "https://musl.cc/${MUSL_TARGET}-cross.tgz" | tar xz -C /opt/ && \
+    ln -s /opt/${MUSL_TARGET}-cross/bin/${MUSL_TARGET}-gcc /usr/local/bin/${MUSL_TARGET}-gcc && \
+    ln -s /opt/${MUSL_TARGET}-cross/bin/${MUSL_TARGET}-ar /usr/local/bin/${MUSL_TARGET}-ar
+
+# Add Rust targets for musl
+RUN rustup target add aarch64-unknown-linux-musl \
+                      armv7-unknown-linux-musleabihf \
+                      x86_64-unknown-linux-musl
+
+WORKDIR /build
+
+# Copy manifests first for better layer caching
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy src to pre-build dependencies
+RUN mkdir -p src/bin && \
+    echo "fn main() {}" > src/bin/client.rs && \
+    echo "fn main() {}" > src/bin/server.rs && \
+    echo "" > src/lib.rs
+
+# Determine Rust target and CC env var, then pre-build dependencies
+RUN case "$TARGETPLATFORM" in \
+        "linux/arm64")  RUST_TARGET="aarch64-unknown-linux-musl"      CC_VAR="aarch64-linux-musl-gcc" ;; \
+        "linux/arm/v7") RUST_TARGET="armv7-unknown-linux-musleabihf"  CC_VAR="armv7l-linux-musleabihf-gcc" ;; \
+        "linux/amd64")  RUST_TARGET="x86_64-unknown-linux-musl"      CC_VAR="x86_64-linux-musl-gcc" ;; \
+    esac && \
+    echo "RUST_TARGET=$RUST_TARGET" > /tmp/build-env && \
+    echo "CC_VAR=$CC_VAR" >> /tmp/build-env && \
+    CC=$CC_VAR RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --profile release-small --target $RUST_TARGET --bin phantom-client 2>/dev/null || true
+
+# Now copy the real source
+COPY src/ src/
+
+# Build the actual binary
+RUN . /tmp/build-env && \
+    CC=$CC_VAR RUSTFLAGS="-C target-feature=+crt-static" \
+    cargo build --profile release-small --target $RUST_TARGET --bin phantom-client && \
+    cp /build/target/$RUST_TARGET/release-small/phantom-client /phantom-client
+
+# --- Stage 2: Extract CA certificates ---
+FROM debian:bookworm-slim AS certs
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Stage 3: Get busybox for /bin/sh (needed by entrypoint script) ---
+FROM busybox:musl AS busybox
+
+# --- Stage 4: Final minimal image ---
+FROM scratch
+
+# CA certificates for TLS verification
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+# Busybox shell for entrypoint script
+COPY --from=busybox /bin/busybox /bin/busybox
+COPY --from=busybox /bin/sh /bin/sh
+
+# Symlinks for commands used by entrypoint
+COPY --from=busybox /bin/mkdir /bin/mkdir
+COPY --from=busybox /bin/cat /bin/cat
+COPY --from=busybox /bin/echo /bin/echo
+
+# The phantom-client binary
+COPY --from=builder /phantom-client /phantom-client
+
+# Entrypoint script
+COPY mikrotik/entrypoint.sh /entrypoint.sh
+
+# Config directory (can be bind-mounted)
+VOLUME ["/config"]
+
+# Default proxy ports
+EXPOSE 1080 8080
+
+ENTRYPOINT ["/bin/sh", "/entrypoint.sh"]
