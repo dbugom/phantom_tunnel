@@ -54,3 +54,9 @@ pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 
 /// Maximum missed Pong responses before declaring the tunnel dead
 pub const MAX_MISSED_PONGS: u32 = 2;
+
+/// Relay read buffer size — 128KB for amortizing syscall overhead
+pub const RELAY_BUFFER_SIZE: usize = 128 * 1024;
+
+/// TLS BufWriter capacity — 64KB for write coalescing
+pub const TLS_BUFWRITER_CAPACITY: usize = 64 * 1024;

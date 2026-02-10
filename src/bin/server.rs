@@ -324,7 +324,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     // Wrap writer in BufWriter to coalesce small writes into fewer TLS records
-    let mut write_half = tokio::io::BufWriter::new(write_half);
+    let mut write_half = tokio::io::BufWriter::with_capacity(phantom_tunnel::tunnel::TLS_BUFWRITER_CAPACITY, write_half);
 
     // Perform Noise handshake
     let (mut noise_transport, client_public) =
@@ -825,8 +825,7 @@ async fn handle_stream(
 
     // Task to read from target and send to tunnel
     let mut target_to_tunnel = tokio::spawn(async move {
-        // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
-        let mut buf = vec![0u8; 65512];
+        let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
         loop {
             match target_read.read(&mut buf).await {
                 Ok(0) => {

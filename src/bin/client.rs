@@ -401,7 +401,7 @@ where
 {
     // Wrap writer in BufWriter to coalesce small writes into fewer TLS records
     // (each raw write_all on a TLS stream creates a separate TLS record with 5+16 bytes overhead)
-    let mut write_half = tokio::io::BufWriter::new(write_half);
+    let mut write_half = tokio::io::BufWriter::with_capacity(phantom_tunnel::tunnel::TLS_BUFWRITER_CAPACITY, write_half);
 
     // Perform Noise handshake using both halves
     let mut noise_transport = match perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &state.server_public).await {
@@ -1005,8 +1005,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
-                let mut buf = vec![0u8; 65512];
+                let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break, // EOF
@@ -1111,8 +1110,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
-                let mut buf = vec![0u8; 65512];
+                let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break,
