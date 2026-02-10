@@ -87,6 +87,8 @@ struct StreamConnection {
     #[allow(dead_code)] // Kept for symmetry, sending uses TunnelCommand::SendData
     data_tx: mpsc::Sender<bytes::Bytes>,
     data_rx: mpsc::Receiver<bytes::Bytes>,
+    /// Cloned tunnel command sender, captured at stream-open time for relay tasks
+    cmd_tx: mpsc::Sender<TunnelCommand>,
 }
 
 /// Tunnel command sent from proxy handlers to tunnel task
@@ -101,7 +103,7 @@ enum TunnelCommand {
 
 /// Shared tunnel handle for proxy handlers
 struct TunnelHandle {
-    cmd_tx: mpsc::Sender<TunnelCommand>,
+    cmd_tx: Arc<std::sync::RwLock<mpsc::Sender<TunnelCommand>>>,
 }
 
 impl TunnelHandle {
@@ -109,8 +111,8 @@ impl TunnelHandle {
     async fn open_stream(&self, destination: String) -> Result<StreamConnection, String> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.cmd_tx
-            .send(TunnelCommand::OpenStream(OpenStreamRequest {
+        let tx = self.cmd_tx.read().unwrap().clone();
+        tx.send(TunnelCommand::OpenStream(OpenStreamRequest {
                 destination,
                 response_tx,
             }))
@@ -227,31 +229,43 @@ async fn main() -> Result<()> {
     let socks5_addr = args.socks5.or(client_config.socks5_listen);
     let http_addr = args.http.or(client_config.http_listen);
 
-    // Create channel for tunnel commands
-    let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCommand>(256);
-    let tunnel_handle = Arc::new(TunnelHandle { cmd_tx });
+    // Create initial channel for tunnel commands
+    let (cmd_tx, _initial_rx) = mpsc::channel::<TunnelCommand>(256);
+    let shared_tx = Arc::new(std::sync::RwLock::new(cmd_tx));
+    let tunnel_handle = Arc::new(TunnelHandle { cmd_tx: Arc::clone(&shared_tx) });
 
-    // Connect to server and run tunnel
+    // Connect to server and run tunnel with robust reconnection
     info!("Connecting to server...");
 
     let tunnel_state = Arc::clone(&state);
-    let tunnel_cmd_rx = cmd_rx;
-    let tunnel_task = tokio::spawn(async move {
-        loop {
-            match run_tunnel(Arc::clone(&tunnel_state), tunnel_cmd_rx).await {
-                Ok(_) => {
-                    info!("Tunnel closed normally");
-                    break;
+    let tunnel_task = tokio::spawn({
+        let shared_tx = Arc::clone(&shared_tx);
+        async move {
+            let mut consecutive_failures: u32 = 0;
+            loop {
+                // Create fresh channel for each connection attempt
+                let (new_tx, cmd_rx) = mpsc::channel::<TunnelCommand>(256);
+                let cmd_tx_for_streams = new_tx.clone();
+                // Update the shared sender so new proxy connections use the new channel
+                *shared_tx.write().unwrap() = new_tx;
+
+                match run_tunnel(Arc::clone(&tunnel_state), cmd_rx, cmd_tx_for_streams).await {
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                        info!("Tunnel disconnected gracefully, reconnecting...");
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        error!("Tunnel error ({} consecutive): {}", consecutive_failures, e);
+                    }
                 }
-                Err(e) => {
-                    error!("Tunnel error: {}", e);
-                    info!("Reconnecting in 5 seconds...");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
+
+                // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (cap)
+                let base = std::cmp::min(30u64, 1u64 << consecutive_failures.min(5));
+                let delay = Duration::from_secs(base);
+                info!("Reconnecting in {:?}...", delay);
+                tokio::time::sleep(delay).await;
             }
-            // After reconnection attempt, we need a new receiver
-            // For now, just break - a more robust implementation would recreate the channel
-            break;
         }
     });
 
@@ -336,6 +350,7 @@ enum ReaderMessage {
 async fn run_tunnel(
     state: Arc<ClientState>,
     cmd_rx: mpsc::Receiver<TunnelCommand>,
+    cmd_tx_for_streams: mpsc::Sender<TunnelCommand>,
 ) -> Result<()> {
     // Connect to server
     let stream = TcpStream::connect(&state.server_addr)
@@ -364,11 +379,11 @@ async fn run_tunnel(
         info!("TLS handshake complete (SNI: {})", sni);
 
         let (read_half, write_half) = tokio::io::split(tls_stream);
-        run_tunnel_inner(state, cmd_rx, read_half, write_half).await
+        run_tunnel_inner(state, cmd_rx, cmd_tx_for_streams, read_half, write_half).await
     } else {
         // Raw TCP (backward compat)
         let (read_half, write_half) = stream.into_split();
-        run_tunnel_inner(state, cmd_rx, read_half, write_half).await
+        run_tunnel_inner(state, cmd_rx, cmd_tx_for_streams, read_half, write_half).await
     }
 }
 
@@ -376,6 +391,7 @@ async fn run_tunnel(
 async fn run_tunnel_inner<R, W>(
     state: Arc<ClientState>,
     mut cmd_rx: mpsc::Receiver<TunnelCommand>,
+    cmd_tx_for_streams: mpsc::Sender<TunnelCommand>,
     mut read_half: R,
     write_half: W,
 ) -> Result<()>
@@ -606,10 +622,13 @@ where
                                 });
 
                                 // Send the connection back to the proxy handler
+                                // Clone the current cmd_tx so relay tasks can send data
+                                // even if the tunnel reconnects (old sender will just fail)
                                 let conn = StreamConnection {
                                     stream_id,
                                     data_tx,
                                     data_rx,
+                                    cmd_tx: cmd_tx_for_streams.clone(),
                                 };
 
                                 let _ = req.response_tx.send(Ok(conn));
@@ -945,7 +964,8 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             // Relay data bidirectionally
             let (mut client_read, mut client_write) = stream.into_split();
             let stream_id = conn.stream_id;
-            let tunnel_clone = Arc::clone(&tunnel);
+            // Use the cmd_tx captured at stream-open time (stable for this connection)
+            let stream_cmd_tx = conn.cmd_tx.clone();
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
@@ -956,7 +976,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
                         Ok(0) => break, // EOF
                         Ok(n) => {
                             let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                            if tunnel_clone.cmd_tx.send(TunnelCommand::SendData {
+                            if stream_cmd_tx.send(TunnelCommand::SendData {
                                 stream_id,
                                 data,
                             }).await.is_err() {
@@ -967,7 +987,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
                     }
                 }
                 // Close the stream when client disconnects
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
+                let _ = stream_cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
             });
 
             // Task to read from tunnel and send to client
@@ -1050,7 +1070,8 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
             // Relay data bidirectionally
             let (mut client_read, mut client_write) = stream.into_split();
             let stream_id = conn.stream_id;
-            let tunnel_clone = Arc::clone(&tunnel);
+            // Use the cmd_tx captured at stream-open time (stable for this connection)
+            let stream_cmd_tx = conn.cmd_tx.clone();
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
@@ -1061,7 +1082,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
                         Ok(0) => break,
                         Ok(n) => {
                             let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                            if tunnel_clone.cmd_tx.send(TunnelCommand::SendData {
+                            if stream_cmd_tx.send(TunnelCommand::SendData {
                                 stream_id,
                                 data,
                             }).await.is_err() {
@@ -1071,7 +1092,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
                         Err(_) => break,
                     }
                 }
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
+                let _ = stream_cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
             });
 
             // Task to read from tunnel and send to client
