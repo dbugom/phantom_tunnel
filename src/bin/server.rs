@@ -186,6 +186,10 @@ async fn main() -> Result<()> {
     info!("Listening on {}", listen_addr);
     info!("Server public key: {}", state.keypair.public.to_base64());
     info!("Noise cipher: AESGCM (AES-256-GCM)");
+    let h2_camouflage_enabled = server_config.h2_camouflage && tls_acceptor.is_some();
+    if h2_camouflage_enabled {
+        info!("H2 CONNECT camouflage: enabled");
+    }
 
     let listener = TcpListener::bind(&listen_addr)
         .await
@@ -201,8 +205,9 @@ async fn main() -> Result<()> {
 
                         let state = Arc::clone(&state);
                         let acceptor = tls_acceptor.clone();
+                        let h2_cam = h2_camouflage_enabled;
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, state, acceptor).await {
+                            if let Err(e) = handle_connection(stream, state, acceptor, h2_cam).await {
                                 debug!("Connection error: {}", e);
                             }
                         });
@@ -287,6 +292,7 @@ async fn handle_connection(
     stream: TcpStream,
     state: Arc<ServerState>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    h2_camouflage: bool,
 ) -> Result<()> {
     // Acquire connection permit (clone Arc first so we can move state into inner fn)
     let inner_state = Arc::clone(&state);
@@ -306,6 +312,25 @@ async fn handle_connection(
             .await
             .context("TLS accept failed")?;
         debug!("TLS handshake complete with client");
+
+        // HTTP/2 CONNECT camouflage (when enabled, Noise tunnel is wrapped in H2 DATA frames)
+        #[cfg(feature = "h2-camouflage")]
+        if h2_camouflage {
+            match phantom_tunnel::transport::h2_camouflage::server_h2_accept(tls_stream).await {
+                Ok(Some((h2_reader, h2_writer))) => {
+                    debug!("H2 CONNECT accepted, proceeding with Noise handshake");
+                    return handle_connection_inner(h2_reader, h2_writer, inner_state).await;
+                }
+                Ok(None) => {
+                    debug!("No valid CONNECT request (possible probe)");
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!("H2 handshake failed (possible probe): {}", e);
+                    return Ok(());
+                }
+            }
+        }
 
         let (read_half, write_half) = tokio::io::split(tls_stream);
         handle_connection_inner(read_half, write_half, inner_state).await

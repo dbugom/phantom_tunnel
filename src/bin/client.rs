@@ -73,6 +73,8 @@ struct ClientState {
     profile: BrowserProfile,
     /// SNI for TLS wrapping (None = raw TCP, Some = TLS wrapping enabled)
     tls_sni: Option<String>,
+    /// Enable HTTP/2 CONNECT camouflage
+    h2_camouflage: bool,
 }
 
 /// Request to open a new stream through the tunnel
@@ -212,6 +214,7 @@ async fn main() -> Result<()> {
         server_addr: args.server.unwrap_or(client_config.server),
         profile,
         tls_sni: client_config.tls_sni,
+        h2_camouflage: client_config.h2_camouflage,
     });
 
     info!("Phantom Tunnel Client v{}", phantom_tunnel::VERSION);
@@ -223,6 +226,9 @@ async fn main() -> Result<()> {
         info!("TLS wrapping disabled (raw TCP)");
     }
     info!("Noise cipher: AESGCM (AES-256-GCM)");
+    if state.h2_camouflage && state.tls_sni.is_some() {
+        info!("H2 CONNECT camouflage: enabled");
+    }
     info!("Client public key: {}...", &state.keypair.public.to_base64()[..16]);
 
     // Start local proxies
@@ -377,6 +383,17 @@ async fn run_tunnel(
             .context("TLS handshake failed")?;
 
         info!("TLS handshake complete (SNI: {})", sni);
+
+        // HTTP/2 CONNECT camouflage (when enabled, wraps Noise tunnel in H2 DATA frames)
+        #[cfg(feature = "h2-camouflage")]
+        if state.h2_camouflage {
+            let (h2_reader, h2_writer) =
+                phantom_tunnel::transport::h2_camouflage::client_h2_connect(tls_stream)
+                    .await
+                    .context("H2 CONNECT camouflage failed")?;
+            info!("H2 CONNECT camouflage active");
+            return run_tunnel_inner(state, cmd_rx, cmd_tx_for_streams, h2_reader, h2_writer).await;
+        }
 
         let (read_half, write_half) = tokio::io::split(tls_stream);
         run_tunnel_inner(state, cmd_rx, cmd_tx_for_streams, read_half, write_half).await
