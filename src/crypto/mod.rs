@@ -11,6 +11,7 @@ mod aead;
 mod handshake;
 mod kdf;
 mod keys;
+pub mod session_cache;
 
 pub use aead::{decrypt_length, encrypt_length, Cipher};
 pub use handshake::{noise_pattern_for_cipher, HandshakeRole, NoiseHandshake, NoiseTransport};
