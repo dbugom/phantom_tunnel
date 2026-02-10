@@ -48,3 +48,9 @@ pub const MAX_STREAMS: u32 = 1024;
 /// Larger window allows higher throughput over high-RTT links:
 /// 4MB / 100ms RTT = 40 MB/s ≈ 320 Mbps theoretical max
 pub const DEFAULT_WINDOW_SIZE: u32 = 4_194_304;
+
+/// Keepalive interval — send Ping every 20 seconds to detect dead connections
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Maximum missed Pong responses before declaring the tunnel dead
+pub const MAX_MISSED_PONGS: u32 = 2;

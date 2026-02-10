@@ -396,6 +396,13 @@ where
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    // Keepalive: Ping/Pong to detect dead connections
+    let mut keepalive_timer = tokio::time::interval(phantom_tunnel::tunnel::KEEPALIVE_INTERVAL);
+    keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_pong = Instant::now();
+    let mut pong_pending = false;
+    let mut missed_pongs: u32 = 0;
+
     loop {
         tokio::select! {
             // Periodic cleanup of expired draining streams
@@ -507,6 +514,19 @@ where
                                 }
                                 let _ = mux.handle_frame(frame).await;
                             }
+                            FrameType::Pong => {
+                                pong_pending = false;
+                                missed_pongs = 0;
+                                last_pong = Instant::now();
+                                debug!("Keepalive PONG received from client");
+                            }
+                            FrameType::Ping => {
+                                // Respond to client pings
+                                let pong_frame = Frame::pong(0);
+                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &pong_frame, &mut encrypt_buf).await?;
+                                write_half.flush().await?;
+                                debug!("Keepalive PONG sent in response to PING");
+                            }
                             _ => {
                                 // Handle other frames through multiplexer
                                 let _ = mux.handle_frame(frame).await;
@@ -553,6 +573,24 @@ where
                         mux.close_stream_local(stream_id);
                     }
                 }
+            }
+
+            // Keepalive timer
+            _ = keepalive_timer.tick() => {
+                if pong_pending {
+                    missed_pongs += 1;
+                    warn!("Missed pong #{} (last pong: {:?} ago)", missed_pongs, last_pong.elapsed());
+                    if missed_pongs >= phantom_tunnel::tunnel::MAX_MISSED_PONGS {
+                        error!("Keepalive timeout -- {} missed pongs, closing connection", phantom_tunnel::tunnel::MAX_MISSED_PONGS);
+                        break;
+                    }
+                }
+                // Send Ping
+                let ping_frame = Frame::ping(0);
+                send_frame_write_buffered(&mut write_half, &mut noise_transport, &ping_frame, &mut encrypt_buf).await?;
+                write_half.flush().await?;
+                pong_pending = true;
+                debug!("Keepalive PING sent");
             }
 
             // Shutdown
