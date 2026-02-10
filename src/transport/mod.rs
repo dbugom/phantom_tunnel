@@ -8,9 +8,15 @@
 
 mod connection;
 mod tcp;
+pub mod tcp_tuning;
 
 #[cfg(feature = "tls")]
 mod tls;
+
+#[cfg(feature = "h2-camouflage")]
+pub mod h2_camouflage;
+
+pub mod probe_resistance;
 
 #[cfg(feature = "dns-tunnel")]
 mod dns;

@@ -341,8 +341,9 @@ async fn run_tunnel(
         .await
         .context("Failed to connect to server")?;
 
-    // Disable Nagle's algorithm to avoid delays on small writes (control frames, length prefixes)
-    stream.set_nodelay(true)?;
+    // Apply TCP optimizations: BBR, large buffers, NODELAY, QUICKACK
+    phantom_tunnel::transport::tcp_tuning::optimize_tcp_stream(&stream)?;
+    phantom_tunnel::transport::tcp_tuning::set_tcp_keepalive(&stream)?;
 
     info!("Connected to server, performing handshake...");
 

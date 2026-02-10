@@ -292,8 +292,9 @@ async fn handle_connection(
         .await
         .context("Failed to acquire connection permit")?;
 
-    // Disable Nagle's algorithm to avoid delays on small writes (control frames, length prefixes)
-    stream.set_nodelay(true)?;
+    // Apply TCP optimizations: BBR, large buffers, NODELAY, QUICKACK
+    phantom_tunnel::transport::tcp_tuning::optimize_tcp_stream(&stream)?;
+    phantom_tunnel::transport::tcp_tuning::set_tcp_keepalive(&stream)?;
 
     if let Some(acceptor) = tls_acceptor {
         // TLS wrapping enabled
@@ -767,8 +768,8 @@ async fn handle_stream(
     // Connect to destination
     let target = match TcpStream::connect(&destination).await {
         Ok(t) => {
-            // Disable Nagle's algorithm on destination connection too
-            let _ = t.set_nodelay(true);
+            // Apply TCP optimizations on destination connection too
+            let _ = phantom_tunnel::transport::tcp_tuning::optimize_tcp_stream(&t);
             info!("Stream {} connected to {}", stream_id, destination);
             t
         }
