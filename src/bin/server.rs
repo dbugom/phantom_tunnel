@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
             let key = load_private_key(&key_path)
                 .context("Failed to load TLS private key")?;
 
-            let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
                 ))
                 .with_safe_default_protocol_versions()
@@ -165,6 +165,9 @@ async fn main() -> Result<()> {
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
                 .context("Failed to build TLS server config")?;
+
+            // ALPN h2 — critical for HTTP/2 CONNECT camouflage
+            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             info!("TLS enabled with cert: {}", cert_path);
             Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))))

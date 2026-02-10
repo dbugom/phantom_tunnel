@@ -69,6 +69,11 @@ pub struct ServerConfig {
     /// Noise cipher: "aesgcm" (default, fast on x86_64) or "chacha" (fast on ARM)
     #[serde(default = "default_cipher")]
     pub cipher: String,
+    /// Enable HTTP/2 CONNECT camouflage (requires TLS)
+    #[serde(default = "default_h2_camouflage")]
+    pub h2_camouflage: bool,
+    /// Decoy backend address for active probing resistance (e.g. "127.0.0.1:8443")
+    pub decoy_backend: Option<String>,
 }
 
 impl Default for ServerConfig {
@@ -83,6 +88,8 @@ impl Default for ServerConfig {
             decoy_site: None,
             max_connections: 1000,
             cipher: default_cipher(),
+            h2_camouflage: true,
+            decoy_backend: None,
         }
     }
 }
@@ -113,6 +120,9 @@ pub struct ClientConfig {
     /// Noise cipher: "aesgcm" (default, fast on x86_64) or "chacha" (fast on ARM)
     #[serde(default = "default_cipher")]
     pub cipher: String,
+    /// Enable HTTP/2 CONNECT camouflage (requires TLS)
+    #[serde(default = "default_h2_camouflage")]
+    pub h2_camouflage: bool,
 }
 
 impl Default for ClientConfig {
@@ -128,6 +138,7 @@ impl Default for ClientConfig {
             tls_profile: "chrome".to_string(),
             enable_padding: true,
             cipher: default_cipher(),
+            h2_camouflage: true,
         }
     }
 }
@@ -172,6 +183,11 @@ impl Default for LoggingConfig {
 /// Default cipher for Noise protocol
 fn default_cipher() -> String {
     "aesgcm".to_string()
+}
+
+/// Default for HTTP/2 CONNECT camouflage (enabled by default when TLS is active)
+fn default_h2_camouflage() -> bool {
+    true
 }
 
 /// Generate example configuration
