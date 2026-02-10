@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
     info!("Phantom Tunnel Server v{}", phantom_tunnel::VERSION);
     info!("Listening on {}", listen_addr);
     info!("Server public key: {}", state.keypair.public.to_base64());
+    info!("Noise cipher: AESGCM (AES-256-GCM)");
 
     let listener = TcpListener::bind(&listen_addr)
         .await

@@ -66,6 +66,9 @@ pub struct ServerConfig {
     pub decoy_site: Option<String>,
     /// Maximum concurrent connections
     pub max_connections: usize,
+    /// Noise cipher: "aesgcm" (default, fast on x86_64) or "chacha" (fast on ARM)
+    #[serde(default = "default_cipher")]
+    pub cipher: String,
 }
 
 impl Default for ServerConfig {
@@ -79,6 +82,7 @@ impl Default for ServerConfig {
             tls_key: None,
             decoy_site: None,
             max_connections: 1000,
+            cipher: default_cipher(),
         }
     }
 }
@@ -106,6 +110,9 @@ pub struct ClientConfig {
     pub tls_profile: String,
     /// Enable padding
     pub enable_padding: bool,
+    /// Noise cipher: "aesgcm" (default, fast on x86_64) or "chacha" (fast on ARM)
+    #[serde(default = "default_cipher")]
+    pub cipher: String,
 }
 
 impl Default for ClientConfig {
@@ -120,6 +127,7 @@ impl Default for ClientConfig {
             tls_sni: None,
             tls_profile: "chrome".to_string(),
             enable_padding: true,
+            cipher: default_cipher(),
         }
     }
 }
@@ -159,6 +167,11 @@ impl Default for LoggingConfig {
             file: None,
         }
     }
+}
+
+/// Default cipher for Noise protocol
+fn default_cipher() -> String {
+    "aesgcm".to_string()
 }
 
 /// Generate example configuration

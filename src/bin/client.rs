@@ -220,6 +220,7 @@ async fn main() -> Result<()> {
     } else {
         info!("TLS wrapping disabled (raw TCP)");
     }
+    info!("Noise cipher: AESGCM (AES-256-GCM)");
     info!("Client public key: {}...", &state.keypair.public.to_base64()[..16]);
 
     // Start local proxies
