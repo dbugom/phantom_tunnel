@@ -84,8 +84,6 @@ struct OpenStreamRequest {
 /// A connection to a remote destination through the tunnel
 struct StreamConnection {
     stream_id: u32,
-    #[allow(dead_code)] // Kept for symmetry, sending uses TunnelCommand::SendData
-    data_tx: mpsc::Sender<bytes::Bytes>,
     data_rx: mpsc::Receiver<bytes::Bytes>,
 }
 
@@ -597,16 +595,17 @@ where
                                 // Create channels for this stream's data
                                 let (data_tx, data_rx) = mpsc::channel(256);
 
-                                // Store the sender for incoming data
+                                // Store the sender for incoming data (sole owner — when
+                                // active_streams drops this, data_rx.recv() returns None,
+                                // allowing the tunnel_to_client task to exit cleanly)
                                 active_streams.insert(stream_id, ActiveStream {
-                                    data_tx: data_tx.clone(),
+                                    data_tx,
                                     draining_since: None,
                                 });
 
                                 // Send the connection back to the proxy handler
                                 let conn = StreamConnection {
                                     stream_id,
-                                    data_tx,
                                     data_rx,
                                 };
 
@@ -946,7 +945,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             let tunnel_clone = Arc::clone(&tunnel);
 
             // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
+            let mut client_to_tunnel = tokio::spawn(async move {
                 // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
                 let mut buf = vec![0u8; 65512];
                 loop {
@@ -964,12 +963,10 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
                         Err(_) => break,
                     }
                 }
-                // Close the stream when client disconnects
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
             });
 
             // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
+            let mut tunnel_to_client = tokio::spawn(async move {
                 while let Some(data) = conn.data_rx.recv().await {
                     if client_write.write_all(&data).await.is_err() {
                         break;
@@ -977,11 +974,18 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
                 }
             });
 
-            // Wait for either direction to complete
+            // Wait for either direction to complete, abort the other
             tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
+                _ = &mut client_to_tunnel => {
+                    tunnel_to_client.abort();
+                }
+                _ = &mut tunnel_to_client => {
+                    client_to_tunnel.abort();
+                }
             }
+
+            // Always send CloseStream to ensure cleanup
+            let _ = tunnel.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
         }
         Err(e) => {
             error!("Failed to open tunnel stream to {}: {}", destination, e);
@@ -1051,7 +1055,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
             let tunnel_clone = Arc::clone(&tunnel);
 
             // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
+            let mut client_to_tunnel = tokio::spawn(async move {
                 // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
                 let mut buf = vec![0u8; 65512];
                 loop {
@@ -1069,11 +1073,10 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
                         Err(_) => break,
                     }
                 }
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
             });
 
             // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
+            let mut tunnel_to_client = tokio::spawn(async move {
                 while let Some(data) = conn.data_rx.recv().await {
                     if client_write.write_all(&data).await.is_err() {
                         break;
@@ -1081,10 +1084,18 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
                 }
             });
 
+            // Wait for either direction to complete, abort the other
             tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
+                _ = &mut client_to_tunnel => {
+                    tunnel_to_client.abort();
+                }
+                _ = &mut tunnel_to_client => {
+                    client_to_tunnel.abort();
+                }
             }
+
+            // Always send CloseStream to ensure cleanup
+            let _ = tunnel.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
         }
         Err(e) => {
             error!("Failed to open tunnel stream to {}: {}", destination, e);
