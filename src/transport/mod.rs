@@ -18,6 +18,9 @@ pub mod h2_camouflage;
 
 pub mod probe_resistance;
 
+#[cfg(feature = "quic")]
+pub mod quic;
+
 #[cfg(feature = "dns-tunnel")]
 mod dns;
 
