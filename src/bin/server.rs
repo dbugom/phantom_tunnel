@@ -583,8 +583,16 @@ where
                             .unwrap_or(true);
 
                         if !is_draining {
-                            let frame = Frame::data(stream_id, data);
-                            send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                            // Split into chunks that fit within Noise's 65535-byte message limit
+                            let max_payload = phantom_tunnel::tunnel::MAX_FRAME_PAYLOAD;
+                            let mut offset = 0;
+                            while offset < data.len() {
+                                let end = std::cmp::min(offset + max_payload, data.len());
+                                let chunk = data.slice(offset..end);
+                                let frame = Frame::data(stream_id, chunk);
+                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                                offset = end;
+                            }
                             write_half.flush().await?;
                         } else {
                             trace!("Dropping outbound data for draining stream {}", stream_id);

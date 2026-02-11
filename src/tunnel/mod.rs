@@ -59,6 +59,12 @@ pub const MAX_MISSED_PONGS: u32 = 2;
 /// Relay read buffer size — 128KB for amortizing syscall overhead
 pub const RELAY_BUFFER_SIZE: usize = 128 * 1024;
 
+/// Maximum frame payload that fits within a single Noise Protocol message.
+/// Noise spec limits messages to 65535 bytes (ciphertext). After subtracting
+/// 16 bytes AEAD tag and 6 bytes frame header, the max payload is 65513.
+/// Data larger than this MUST be split into multiple frames before encryption.
+pub const MAX_FRAME_PAYLOAD: usize = 65535 - 16 - FRAME_HEADER_SIZE;
+
 /// TLS BufWriter capacity — 64KB for write coalescing
 pub const TLS_BUFWRITER_CAPACITY: usize = 64 * 1024;
 
