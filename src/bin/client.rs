@@ -262,7 +262,7 @@ async fn main() -> Result<()> {
                     }
                     Err(e) => {
                         consecutive_failures += 1;
-                        error!("Tunnel error ({} consecutive): {}", consecutive_failures, e);
+                        error!("Tunnel error ({} consecutive): {:#}", consecutive_failures, e);
                     }
                 }
 

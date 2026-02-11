@@ -206,9 +206,15 @@ where
         .handshake::<T, Bytes>(tls_stream)
         .await?;
 
-    // Wait for the CONNECT request
-    while let Some(result) = connection.accept().await {
-        let (request, mut respond): (http::Request<h2::RecvStream>, h2::server::SendResponse<Bytes>) = result?;
+    // Wait for the first valid CONNECT request.
+    // Use loop+match so `connection` can be moved into spawn after break.
+    let (send_stream, recv_stream) = loop {
+        let result = match connection.accept().await {
+            Some(r) => r?,
+            None => return Ok(None), // Connection closed without CONNECT
+        };
+
+        let (request, mut respond) = result;
 
         if request.method() != Method::CONNECT {
             // Not a CONNECT — respond with 404 (looks like a normal web server)
@@ -230,12 +236,34 @@ where
 
         let send_stream = respond.send_response(response, false)?;
         let recv_stream = request.into_body();
+        break (send_stream, recv_stream);
+    };
 
-        let (reader, writer) = h2_to_async_io(send_stream, recv_stream)?;
-        return Ok(Some((reader, writer)));
-    }
+    // CRITICAL: Spawn the H2 connection driver in the background.
+    // The h2::server::Connection drives all I/O for H2 streams.
+    // Without this, dropping `connection` kills all streams immediately
+    // (causing "stream closed because of a broken pipe").
+    tokio::spawn(async move {
+        while let Some(result) = connection.accept().await {
+            match result {
+                Ok((_req, mut respond)) => {
+                    // Reject any additional streams with 404
+                    let response = http::Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(response, true);
+                }
+                Err(e) => {
+                    debug!("H2 server connection driver error: {e}");
+                    break;
+                }
+            }
+        }
+    });
 
-    Ok(None) // Connection closed without valid CONNECT
+    let (reader, writer) = h2_to_async_io(send_stream, recv_stream)?;
+    Ok(Some((reader, writer)))
 }
 
 // ============================================================
