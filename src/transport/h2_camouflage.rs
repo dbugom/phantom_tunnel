@@ -23,10 +23,11 @@ use tracing::{debug, error, info};
 const CONNECT_AUTHORITY: &str = "api.google.com:443";
 
 // ============================================================
-// Channel-based AsyncRead/AsyncWrite adapters for H2 streams
+// AsyncRead adapter (channel-based, for H2 RecvStream)
 // ============================================================
 
 /// AsyncRead adapter backed by an mpsc channel receiving Bytes from H2 RecvStream.
+/// The channel is needed because h2::RecvStream::data() is async-only (no poll variant).
 pub struct ChannelReader {
     rx: mpsc::Receiver<Bytes>,
     buf: BytesMut,
@@ -77,41 +78,57 @@ impl AsyncRead for ChannelReader {
     }
 }
 
-/// AsyncWrite adapter that sends Bytes over an mpsc channel to H2 SendStream.
-pub struct ChannelWriter {
-    tx: mpsc::Sender<Bytes>,
+// ============================================================
+// AsyncWrite adapter (direct H2 SendStream, no channel)
+// ============================================================
+
+/// AsyncWrite adapter wrapping H2 SendStream directly.
+/// Uses poll_capacity() for proper async flow control instead of busy-polling.
+/// Eliminates the channel + spawned task overhead of the old ChannelWriter.
+pub struct H2Writer {
+    h2_send: h2::SendStream<Bytes>,
 }
 
-impl ChannelWriter {
-    pub fn new(tx: mpsc::Sender<Bytes>) -> Self {
-        Self { tx }
+impl H2Writer {
+    pub fn new(h2_send: h2::SendStream<Bytes>) -> Self {
+        Self { h2_send }
     }
 }
 
-impl AsyncWrite for ChannelWriter {
+impl AsyncWrite for H2Writer {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.get_mut();
-        let data = Bytes::copy_from_slice(buf);
-        let len = data.len();
 
-        // Try to send via channel
-        match this.tx.try_send(data) {
-            Ok(()) => Poll::Ready(Ok(len)),
-            Err(mpsc::error::TrySendError::Full(_data)) => {
-                // Channel full — register waker and retry
-                cx.waker().wake_by_ref();
-                Poll::Pending
+        // Tell H2 how much we want to send
+        this.h2_send.reserve_capacity(buf.len());
+
+        // Wait for flow control capacity using proper async polling
+        match this.h2_send.poll_capacity(cx) {
+            Poll::Ready(Some(Ok(cap))) => {
+                // Send up to available capacity (write_all handles partial writes)
+                let n = std::cmp::min(cap, buf.len());
+                let data = Bytes::copy_from_slice(&buf[..n]);
+                match this.h2_send.send_data(data, false) {
+                    Ok(()) => Poll::Ready(Ok(n)),
+                    Err(e) => Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("H2 send error: {e}"),
+                    ))),
+                }
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                Poll::Ready(Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "H2 write channel closed",
-                )))
-            }
+            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("H2 capacity error: {e}"),
+            ))),
+            Poll::Ready(None) => Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "H2 send stream closed",
+            ))),
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -120,6 +137,8 @@ impl AsyncWrite for ChannelWriter {
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let _ = this.h2_send.send_data(Bytes::new(), true);
         Poll::Ready(Ok(()))
     }
 }
@@ -129,11 +148,11 @@ impl AsyncWrite for ChannelWriter {
 // ============================================================
 
 /// Wraps a TLS stream in HTTP/2 and opens a CONNECT tunnel.
-/// Returns (ChannelReader, ChannelWriter) that implement AsyncRead/AsyncWrite
+/// Returns (ChannelReader, H2Writer) that implement AsyncRead/AsyncWrite
 /// for the Noise Protocol handshake and subsequent tunnel frames.
 pub async fn client_h2_connect<T>(
     tls_stream: T,
-) -> anyhow::Result<(ChannelReader, ChannelWriter)>
+) -> anyhow::Result<(ChannelReader, H2Writer)>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -181,7 +200,7 @@ where
 
     info!("H2 CONNECT tunnel established to {CONNECT_AUTHORITY}");
 
-    // Bridge H2 streams to AsyncRead/AsyncWrite via channels
+    // Bridge H2 streams to AsyncRead/AsyncWrite
     h2_to_async_io(send_stream, recv_stream)
 }
 
@@ -194,7 +213,7 @@ where
 /// no valid CONNECT was received (caller should proxy to decoy).
 pub async fn server_h2_accept<T>(
     tls_stream: T,
-) -> anyhow::Result<Option<(ChannelReader, ChannelWriter)>>
+) -> anyhow::Result<Option<(ChannelReader, H2Writer)>>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -241,8 +260,7 @@ where
 
     // CRITICAL: Spawn the H2 connection driver in the background.
     // The h2::server::Connection drives all I/O for H2 streams.
-    // Without this, dropping `connection` kills all streams immediately
-    // (causing "stream closed because of a broken pipe").
+    // Without this, dropping `connection` kills all streams immediately.
     tokio::spawn(async move {
         while let Some(result) = connection.accept().await {
             match result {
@@ -271,18 +289,23 @@ where
 // ============================================================
 
 /// Create an AsyncRead/AsyncWrite pair backed by H2 send/recv streams.
-/// Spawns background tasks to pump data between H2 and channels.
+///
+/// Read side: spawns a background task pumping H2 RecvStream -> mpsc -> ChannelReader
+/// (channel needed because RecvStream::data() is async-only, no poll variant).
+///
+/// Write side: wraps H2 SendStream directly in H2Writer using poll_capacity()
+/// (no channel, no spawned task — eliminates the busy-poll bottleneck).
 fn h2_to_async_io(
-    mut h2_send: h2::SendStream<Bytes>,
+    h2_send: h2::SendStream<Bytes>,
     mut h2_recv: RecvStream,
-) -> anyhow::Result<(ChannelReader, ChannelWriter)> {
+) -> anyhow::Result<(ChannelReader, H2Writer)> {
     // Read side: H2 recv -> channel -> AsyncRead
-    let (read_tx, read_rx) = mpsc::channel::<Bytes>(64);
+    let (read_tx, read_rx) = mpsc::channel::<Bytes>(256);
     tokio::spawn(async move {
         loop {
             match h2_recv.data().await {
                 Some(Ok(data)) => {
-                    // Release flow control capacity
+                    // Release flow control capacity immediately
                     let _ = h2_recv.flow_control().release_capacity(data.len());
                     if read_tx.send(data).await.is_err() {
                         break;
@@ -300,34 +323,9 @@ fn h2_to_async_io(
         }
     });
 
-    // Write side: AsyncWrite -> channel -> H2 send
-    let (write_tx, mut write_rx) = mpsc::channel::<Bytes>(64);
-    tokio::spawn(async move {
-        while let Some(data) = write_rx.recv().await {
-            // Reserve capacity before sending
-            h2_send.reserve_capacity(data.len());
-
-            // Wait for flow control capacity
-            loop {
-                let cap = h2_send.capacity();
-                if cap > 0 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-                h2_send.reserve_capacity(data.len());
-            }
-
-            if let Err(e) = h2_send.send_data(data, false) {
-                debug!("H2 send error: {e}");
-                break;
-            }
-        }
-        // End of stream
-        let _ = h2_send.send_data(Bytes::new(), true);
-    });
-
+    // Write side: direct H2 SendStream wrapper (no channel, no spawned task)
+    let writer = H2Writer::new(h2_send);
     let reader = ChannelReader::new(read_rx);
-    let writer = ChannelWriter::new(write_tx);
 
     Ok((reader, writer))
 }
