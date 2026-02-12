@@ -87,8 +87,8 @@ struct OpenStreamRequest {
 struct StreamConnection {
     stream_id: u32,
     #[allow(dead_code)] // Kept for symmetry, sending uses TunnelCommand::SendData
-    data_tx: mpsc::Sender<bytes::Bytes>,
-    data_rx: mpsc::Receiver<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
+    data_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
     /// Cloned tunnel command sender, captured at stream-open time for relay tasks
     cmd_tx: mpsc::Sender<TunnelCommand>,
 }
@@ -337,7 +337,7 @@ fn generate_keypair() -> Result<()> {
 
 /// Active stream state in the tunnel
 struct ActiveStream {
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
     /// If Some, the stream is draining (closed by client, waiting for cleanup)
     draining_since: Option<Instant>,
 }
@@ -559,30 +559,15 @@ where
                                         trace!("Dropping data for draining stream {}: {} bytes",
                                                frame.stream_id, frame.payload.len());
                                     } else {
-                                        // CRITICAL: Update flow control BEFORE forwarding data to the
-                                        // stream channel. data_tx.send().await can block when the
-                                        // channel is full (browser reading slowly). If we block before
-                                        // updating recv_window, the server never gets WindowUpdate
-                                        // frames and its send_window hits 0 → deadlock.
+                                        // Update flow control tracking before forwarding data.
+                                        // Uses unbounded channel so send() never blocks the main loop.
                                         if let Err(e) = mux.handle_frame(frame.clone()).await {
                                             debug!("Frame handling error: {}", e);
                                         }
                                         mux_already_handled = true;
 
-                                        // Flush any queued WindowUpdate frames to the server NOW,
-                                        // before the potentially-blocking channel send
-                                        let queued = mux.take_send_queue();
-                                        let has_queued = !queued.is_empty();
-                                        for queued_frame in queued {
-                                            send_frame_write_buffered(&mut write_half, &mut noise_transport, &queued_frame, &mut encrypt_buf).await?;
-                                        }
-                                        if has_queued {
-                                            write_half.flush().await?;
-                                        }
-
-                                        // Now forward data to the stream — may block, but server
-                                        // already has replenished window
-                                        if active.data_tx.send(frame.payload.clone()).await.is_err() {
+                                        // Forward data to the stream relay task (non-blocking)
+                                        if active.data_tx.send(frame.payload.clone()).is_err() {
                                             // Channel closed - mark as draining instead of removing
                                             debug!("Stream {} receiver closed, marking as draining", frame.stream_id);
                                             if let Some(stream) = active_streams.get_mut(&frame.stream_id) {
@@ -678,8 +663,9 @@ where
                                     continue;
                                 }
 
-                                // Create channels for this stream's data
-                                let (data_tx, data_rx) = mpsc::channel(256);
+                                // Unbounded channel: never blocks the main loop when
+                                // the downstream consumer (browser) is slow
+                                let (data_tx, data_rx) = mpsc::unbounded_channel();
 
                                 // Store the sender for incoming data
                                 active_streams.insert(stream_id, ActiveStream {
