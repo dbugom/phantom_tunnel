@@ -463,6 +463,9 @@ where
     // Reusable encryption buffer
     let mut encrypt_buf = vec![0u8; 65536 + 16];
 
+    // Reusable wire buffer (avoids allocation per frame)
+    let mut wire_buf = Vec::with_capacity(65536 + 16 + 2);
+
     // Interval for cleaning up expired draining streams
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -567,7 +570,7 @@ where
                                 // BDP measurement: track bytes received
                                 if bdp.on_data_received(payload_len) {
                                     let ping_frame = Frame::ping(0);
-                                    let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                                    let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf, &mut wire_buf)?;
                                     write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                     trace!("BDP measurement PING sent");
                                 }
@@ -613,7 +616,7 @@ where
                             FrameType::Ping => {
                                 // Respond to client pings
                                 let pong_frame = Frame::pong(0);
-                                let wire = encrypt_frame_to_wire(&mut noise_transport, &pong_frame, &mut encrypt_buf)?;
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &pong_frame, &mut encrypt_buf, &mut wire_buf)?;
                                 write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                 debug!("Keepalive PONG sent in response to PING");
                             }
@@ -652,7 +655,7 @@ where
                                 let end = std::cmp::min(offset + max_payload, data.len());
                                 let chunk = data.slice(offset..end);
                                 let frame = Frame::data(stream_id, chunk);
-                                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf)?;
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf, &mut wire_buf)?;
                                 write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                 offset = end;
                             }
@@ -685,7 +688,7 @@ where
                 }
                 // Send Ping
                 let ping_frame = Frame::ping(0);
-                let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf, &mut wire_buf)?;
                 write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                 pong_pending = true;
                 debug!("Keepalive PING sent");
@@ -712,7 +715,7 @@ where
                 .unwrap_or(false);
 
             if !is_draining || frame.frame_type == FrameType::StreamClose {
-                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf)?;
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf, &mut wire_buf)?;
                 write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
             }
         }
@@ -873,12 +876,14 @@ async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
-/// Encrypt a frame and return the wire bytes (2-byte length prefix + ciphertext).
+/// Encrypt a frame into a reusable wire buffer (2-byte length prefix + ciphertext).
 /// CPU-only, no I/O — safe to call from the main select! loop without blocking.
+/// Returns the wire bytes as a Vec (taken from wire_buf to avoid allocation when possible).
 fn encrypt_frame_to_wire(
     noise: &mut NoiseTransport,
     frame: &Frame,
     encrypt_buf: &mut Vec<u8>,
+    wire_buf: &mut Vec<u8>,
 ) -> Result<Vec<u8>> {
     let plaintext = frame.encode();
 
@@ -896,18 +901,17 @@ fn encrypt_frame_to_wire(
            frame.frame_type, frame.stream_id, ct_len);
 
     // Build wire format: 2-byte BE length prefix + ciphertext
-    // Safety: ct_len MUST fit in u16. If it doesn't, the length prefix would
-    // silently overflow, corrupting the wire stream (the receiver would read
-    // a wrong frame size and all subsequent frames would be garbage).
     assert!(ct_len <= u16::MAX as usize,
         "encrypted frame too large for u16 wire prefix: {} bytes (max {})",
         ct_len, u16::MAX);
     let len_bytes = (ct_len as u16).to_be_bytes();
-    let mut wire_buf = Vec::with_capacity(2 + ct_len);
+    wire_buf.clear();
+    wire_buf.reserve(2 + ct_len);
     wire_buf.extend_from_slice(&len_bytes);
     wire_buf.extend_from_slice(&encrypt_buf[..ct_len]);
 
-    Ok(wire_buf)
+    // Return owned copy — wire_buf keeps its allocation for next call
+    Ok(wire_buf.clone())
 }
 
 /// Send an encrypted frame (legacy, for non-split streams)

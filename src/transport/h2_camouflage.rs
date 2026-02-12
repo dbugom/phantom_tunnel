@@ -165,7 +165,7 @@ where
     let (send_request, connection) = h2::client::Builder::new()
         .initial_window_size(16 * 1024 * 1024) // 16MB stream window
         .initial_connection_window_size(16 * 1024 * 1024) // 16MB connection window
-        .max_frame_size(16_384) // Chrome default
+        .max_frame_size(65_535) // Max H2 DATA frame size we accept (inside TLS, invisible to DPI)
         .max_header_list_size(262_144) // 256KB
         .header_table_size(65_536) // 64KB
         .enable_push(false) // Chrome disables push
@@ -225,7 +225,7 @@ where
     let mut connection = h2::server::Builder::new()
         .initial_window_size(16 * 1024 * 1024) // 16MB stream window
         .initial_connection_window_size(16 * 1024 * 1024) // 16MB connection window
-        .max_frame_size(16_384)
+        .max_frame_size(65_535) // Max H2 DATA frame size we accept
         .max_header_list_size(262_144)
         .handshake::<T, Bytes>(tls_stream)
         .await?;
