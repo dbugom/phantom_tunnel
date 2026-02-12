@@ -307,8 +307,11 @@ fn h2_to_async_io(
         loop {
             match h2_recv.data().await {
                 Some(Ok(data)) => {
-                    // Release flow control capacity immediately
-                    let _ = h2_recv.flow_control().release_capacity(data.len());
+                    // Release flow control capacity immediately so the peer
+                    // gets WINDOW_UPDATE and can keep sending.
+                    if let Err(e) = h2_recv.flow_control().release_capacity(data.len()) {
+                        debug!("H2 release_capacity failed ({}B): {e}", data.len());
+                    }
                     if read_tx.send(data).is_err() {
                         break;
                     }

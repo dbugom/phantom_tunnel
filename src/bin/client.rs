@@ -432,7 +432,10 @@ where
     info!("Handshake complete, tunnel established");
 
     // Create channel for reader task to send frames to main loop
-    let (reader_tx, mut reader_rx) = mpsc::channel::<ReaderMessage>(256);
+    // Unbounded: prevents reader task from blocking when main loop is busy
+    // writing to H2 (which can block on flow control). H2 flow control
+    // limits memory naturally.
+    let (reader_tx, mut reader_rx) = mpsc::unbounded_channel::<ReaderMessage>();
 
     // Spawn dedicated reader task - this will NOT be cancelled by select!
     tokio::spawn(async move {
@@ -442,28 +445,28 @@ where
             let mut len_buf = [0u8; 2];
             if let Err(e) = read_half.read_exact(&mut len_buf).await {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    let _ = reader_tx.send(ReaderMessage::Closed).await;
+                    let _ = reader_tx.send(ReaderMessage::Closed);
                 } else {
-                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 }
                 break;
             }
 
             let frame_len = u16::from_be_bytes(len_buf) as usize;
             if frame_len > buf.len() {
-                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len))).await;
+                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len)));
                 break;
             }
 
             // Read frame data
             if let Err(e) = read_half.read_exact(&mut buf[..frame_len]).await {
-                let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 break;
             }
 
-            // Send complete frame to main loop
+            // Send complete frame to main loop (non-blocking)
             let frame_data = buf[..frame_len].to_vec();
-            if reader_tx.send(ReaderMessage::Frame(frame_data)).await.is_err() {
+            if reader_tx.send(ReaderMessage::Frame(frame_data)).is_err() {
                 break; // Main loop closed
             }
         }

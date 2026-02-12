@@ -368,7 +368,10 @@ where
     info!("Client connected: {}...", &client_key_b64[..16]);
 
     // Create channel for reader task to send frames to main loop
-    let (reader_tx, mut reader_rx) = mpsc::channel::<ReaderMessage>(256);
+    // Unbounded: prevents reader task from blocking when main loop is busy
+    // writing to H2 (which can block on flow control). H2 flow control
+    // limits memory naturally.
+    let (reader_tx, mut reader_rx) = mpsc::unbounded_channel::<ReaderMessage>();
 
     // Spawn dedicated reader task - this will NOT be cancelled by select!
     tokio::spawn(async move {
@@ -378,28 +381,28 @@ where
             let mut len_buf = [0u8; 2];
             if let Err(e) = read_half.read_exact(&mut len_buf).await {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    let _ = reader_tx.send(ReaderMessage::Closed).await;
+                    let _ = reader_tx.send(ReaderMessage::Closed);
                 } else {
-                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 }
                 break;
             }
 
             let frame_len = u16::from_be_bytes(len_buf) as usize;
             if frame_len > buf.len() {
-                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len))).await;
+                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len)));
                 break;
             }
 
             // Read frame data
             if let Err(e) = read_half.read_exact(&mut buf[..frame_len]).await {
-                let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 break;
             }
 
-            // Send complete frame to main loop
+            // Send complete frame to main loop (non-blocking)
             let frame_data = buf[..frame_len].to_vec();
-            if reader_tx.send(ReaderMessage::Frame(frame_data)).await.is_err() {
+            if reader_tx.send(ReaderMessage::Frame(frame_data)).is_err() {
                 break; // Main loop closed
             }
         }
@@ -412,7 +415,10 @@ where
     let mut active_streams: HashMap<u32, ActiveStream> = HashMap::new();
 
     // Channel for stream tasks to send data back through tunnel
-    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<StreamToTunnel>(256);
+    // Unbounded: prevents relay tasks from blocking when the main loop is
+    // busy writing to H2 (flow-control stall). H2 + TCP flow control
+    // bound memory naturally.
+    let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<StreamToTunnel>();
 
     // Buffer for decryption (reused to avoid allocations)
     let mut frame_buf = vec![0u8; 65536];
@@ -839,7 +845,7 @@ async fn handle_stream(
     stream_id: u32,
     destination: String,
     mut data_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
-    tunnel_tx: mpsc::Sender<StreamToTunnel>,
+    tunnel_tx: mpsc::UnboundedSender<StreamToTunnel>,
 ) -> Result<()> {
     // Connect to destination
     let target = match TcpStream::connect(&destination).await {
@@ -852,7 +858,7 @@ async fn handle_stream(
         Err(e) => {
             error!("Stream {} failed to connect to {}: {}", stream_id, destination, e);
             // Send close to client
-            let _ = tunnel_tx.send(StreamToTunnel::Close { stream_id }).await;
+            let _ = tunnel_tx.send(StreamToTunnel::Close { stream_id });
             return Err(e.into());
         }
     };
@@ -860,7 +866,7 @@ async fn handle_stream(
     let (mut target_read, mut target_write) = target.into_split();
     let tunnel_tx_clone = tunnel_tx.clone();
 
-    // Task to read from target and send to tunnel
+    // Task to read from target and send to tunnel (non-blocking sends)
     let mut target_to_tunnel = tokio::spawn(async move {
         let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
         loop {
@@ -871,7 +877,7 @@ async fn handle_stream(
                 }
                 Ok(n) => {
                     let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                    if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).await.is_err() {
+                    if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).is_err() {
                         break;
                     }
                 }
@@ -882,7 +888,7 @@ async fn handle_stream(
             }
         }
         // Send close when target disconnects
-        let _ = tunnel_tx_clone.send(StreamToTunnel::Close { stream_id }).await;
+        let _ = tunnel_tx_clone.send(StreamToTunnel::Close { stream_id });
     });
 
     // Task to read from tunnel and send to target
