@@ -59,11 +59,20 @@ pub const MAX_MISSED_PONGS: u32 = 2;
 /// Relay read buffer size — 128KB for amortizing syscall overhead
 pub const RELAY_BUFFER_SIZE: usize = 128 * 1024;
 
-/// Maximum frame payload that fits within a single Noise Protocol message.
-/// Noise spec limits messages to 65535 bytes (ciphertext). After subtracting
-/// 16 bytes AEAD tag and 6 bytes frame header, the max payload is 65513.
-/// Data larger than this MUST be split into multiple frames before encryption.
-pub const MAX_FRAME_PAYLOAD: usize = 65535 - 16 - FRAME_HEADER_SIZE;
+/// Maximum frame payload that fits within a single Noise Protocol message
+/// AND within the u16 wire length prefix (max 65535 bytes on the wire).
+///
+/// Wire format: [u16 length] [encrypted frame]
+/// Encrypted frame = encode(header + payload) + 16-byte AEAD tag
+/// Encoded frame = FRAME_HEADER_SIZE(6) + padding_len_byte(1) + payload = 7 + payload
+///
+/// Constraint: 7 + payload + 16 <= 65535  →  payload <= 65512
+///
+/// BUG FIX: Previously used FRAME_HEADER_SIZE (6) which doesn't include the
+/// padding_len byte always written by encode(). This made MAX_FRAME_PAYLOAD
+/// = 65513, producing 65536-byte ciphertexts that overflow u16 to 0,
+/// corrupting the wire stream and killing downloads.
+pub const MAX_FRAME_PAYLOAD: usize = 65535 - 16 - FRAME_HEADER_SIZE - 1;
 
 /// TLS BufWriter capacity — 64KB for write coalescing
 pub const TLS_BUFWRITER_CAPACITY: usize = 64 * 1024;

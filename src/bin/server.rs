@@ -866,6 +866,12 @@ fn encrypt_frame_to_wire(
            frame.frame_type, frame.stream_id, ct_len);
 
     // Build wire format: 2-byte BE length prefix + ciphertext
+    // Safety: ct_len MUST fit in u16. If it doesn't, the length prefix would
+    // silently overflow, corrupting the wire stream (the receiver would read
+    // a wrong frame size and all subsequent frames would be garbage).
+    assert!(ct_len <= u16::MAX as usize,
+        "encrypted frame too large for u16 wire prefix: {} bytes (max {})",
+        ct_len, u16::MAX);
     let len_bytes = (ct_len as u16).to_be_bytes();
     let mut wire_buf = Vec::with_capacity(2 + ct_len);
     wire_buf.extend_from_slice(&len_bytes);
