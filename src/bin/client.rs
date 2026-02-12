@@ -547,6 +547,10 @@ where
                             debug!("Decoded frame: type={:?} stream={} payload={} bytes",
                                    frame.frame_type, frame.stream_id, frame.payload.len());
 
+                            // Track whether mux.handle_frame() was already called
+                            // (Data frames call it early to prevent flow control deadlock)
+                            let mut mux_already_handled = false;
+
                             // Handle data frames specially - forward to stream handler
                             if frame.frame_type == FrameType::Data {
                                 if let Some(active) = active_streams.get(&frame.stream_id) {
@@ -554,11 +558,36 @@ where
                                         // Stream is draining - silently drop data (in-flight from server)
                                         trace!("Dropping data for draining stream {}: {} bytes",
                                                frame.stream_id, frame.payload.len());
-                                    } else if active.data_tx.send(frame.payload.clone()).await.is_err() {
-                                        // Channel closed - mark as draining instead of removing
-                                        debug!("Stream {} receiver closed, marking as draining", frame.stream_id);
-                                        if let Some(stream) = active_streams.get_mut(&frame.stream_id) {
-                                            stream.draining_since = Some(Instant::now());
+                                    } else {
+                                        // CRITICAL: Update flow control BEFORE forwarding data to the
+                                        // stream channel. data_tx.send().await can block when the
+                                        // channel is full (browser reading slowly). If we block before
+                                        // updating recv_window, the server never gets WindowUpdate
+                                        // frames and its send_window hits 0 → deadlock.
+                                        if let Err(e) = mux.handle_frame(frame.clone()).await {
+                                            debug!("Frame handling error: {}", e);
+                                        }
+                                        mux_already_handled = true;
+
+                                        // Flush any queued WindowUpdate frames to the server NOW,
+                                        // before the potentially-blocking channel send
+                                        let queued = mux.take_send_queue();
+                                        let has_queued = !queued.is_empty();
+                                        for queued_frame in queued {
+                                            send_frame_write_buffered(&mut write_half, &mut noise_transport, &queued_frame, &mut encrypt_buf).await?;
+                                        }
+                                        if has_queued {
+                                            write_half.flush().await?;
+                                        }
+
+                                        // Now forward data to the stream — may block, but server
+                                        // already has replenished window
+                                        if active.data_tx.send(frame.payload.clone()).await.is_err() {
+                                            // Channel closed - mark as draining instead of removing
+                                            debug!("Stream {} receiver closed, marking as draining", frame.stream_id);
+                                            if let Some(stream) = active_streams.get_mut(&frame.stream_id) {
+                                                stream.draining_since = Some(Instant::now());
+                                            }
                                         }
                                     }
                                 } else {
@@ -588,16 +617,18 @@ where
                                 debug!("Keepalive PONG sent in response to PING");
                             }
 
-                            // Only let multiplexer handle frame if stream is not draining
-                            // This prevents WindowUpdate frames for draining streams
-                            let is_draining = active_streams
-                                .get(&frame.stream_id)
-                                .map(|s| s.draining_since.is_some())
-                                .unwrap_or(false);
+                            // Let multiplexer handle non-Data frames (StreamClose, Ping, Pong)
+                            // Data frames were already handled above before the channel send
+                            if !mux_already_handled {
+                                let is_draining = active_streams
+                                    .get(&frame.stream_id)
+                                    .map(|s| s.draining_since.is_some())
+                                    .unwrap_or(false);
 
-                            if !is_draining {
-                                if let Err(e) = mux.handle_frame(frame).await {
-                                    debug!("Frame handling error: {}", e);
+                                if !is_draining {
+                                    if let Err(e) = mux.handle_frame(frame).await {
+                                        debug!("Frame handling error: {}", e);
+                                    }
                                 }
                             }
                         }
