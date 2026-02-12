@@ -157,9 +157,12 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Perform HTTP/2 handshake with Chrome-like SETTINGS
+    // Window sizes set to 16MB to prevent flow control stalls in long-lived tunnels.
+    // The h2 crate only sends WINDOW_UPDATE after release_capacity() is called AND
+    // the connection future is polled — small windows exhaust before updates arrive.
     let (send_request, connection) = h2::client::Builder::new()
-        .initial_window_size(6_291_456) // Chrome: 6MB
-        .initial_connection_window_size(15_728_640) // Chrome: 15MB
+        .initial_window_size(16 * 1024 * 1024) // 16MB stream window
+        .initial_connection_window_size(16 * 1024 * 1024) // 16MB connection window
         .max_frame_size(16_384) // Chrome default
         .max_header_list_size(262_144) // 256KB
         .header_table_size(65_536) // 64KB
@@ -218,8 +221,8 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut connection = h2::server::Builder::new()
-        .initial_window_size(6_291_456)
-        .initial_connection_window_size(15_728_640)
+        .initial_window_size(16 * 1024 * 1024) // 16MB stream window
+        .initial_connection_window_size(16 * 1024 * 1024) // 16MB connection window
         .max_frame_size(16_384)
         .max_header_list_size(262_144)
         .handshake::<T, Bytes>(tls_stream)
@@ -303,16 +306,28 @@ fn h2_to_async_io(
     // Unbounded so this task never blocks on send — H2 flow control on the wire
     // limits how much data can be in-flight, bounding memory naturally.
     let (read_tx, read_rx) = mpsc::unbounded_channel::<Bytes>();
+    // Clone the FlowControl handle BEFORE entering the recv loop.
+    // In h2 v0.4, flow_control() returns by value — calling it inside the loop
+    // after data() has been called can return a stale snapshot. Cloning once
+    // ensures release_capacity() always targets the live flow control state,
+    // so WINDOW_UPDATE frames are actually queued and sent by the connection driver.
+    let mut flow_ctl = h2_recv.flow_control().clone();
     tokio::spawn(async move {
         loop {
             match h2_recv.data().await {
                 Some(Ok(data)) => {
-                    // Release flow control capacity immediately so the peer
-                    // gets WINDOW_UPDATE and can keep sending.
-                    if let Err(e) = h2_recv.flow_control().release_capacity(data.len()) {
-                        debug!("H2 release_capacity failed ({}B): {e}", data.len());
+                    let len = data.len();
+                    // Forward data to channel first, then release capacity.
+                    // Even if the channel send fails, we still release capacity
+                    // to avoid leaking flow control budget.
+                    let send_ok = read_tx.send(data).is_ok();
+                    // Release flow control capacity so the h2 connection driver
+                    // sends WINDOW_UPDATE to the peer, replenishing their send budget.
+                    if let Err(e) = flow_ctl.release_capacity(len) {
+                        debug!("H2 release_capacity failed ({len}B): {e}");
+                        break;
                     }
-                    if read_tx.send(data).is_err() {
+                    if !send_ok {
                         break;
                     }
                 }
