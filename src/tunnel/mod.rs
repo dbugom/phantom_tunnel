@@ -45,10 +45,10 @@ pub enum TunnelError {
 /// Maximum number of concurrent streams
 pub const MAX_STREAMS: u32 = 1024;
 
-/// Default window size for flow control (4 MB)
+/// Default window size for flow control (16 MB)
 /// Larger window allows higher throughput over high-RTT links:
-/// 4MB / 100ms RTT = 40 MB/s ≈ 320 Mbps theoretical max
-pub const DEFAULT_WINDOW_SIZE: u32 = 4_194_304;
+/// 16MB / 100ms RTT = 160 MB/s ≈ 1.28 Gbps theoretical max
+pub const DEFAULT_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 
 /// Keepalive interval — send Ping every 20 seconds to detect dead connections
 pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
@@ -56,8 +56,8 @@ pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// Maximum missed Pong responses before declaring the tunnel dead
 pub const MAX_MISSED_PONGS: u32 = 2;
 
-/// Relay read buffer size — 128KB for amortizing syscall overhead
-pub const RELAY_BUFFER_SIZE: usize = 128 * 1024;
+/// Relay read buffer size — 512KB for amortizing syscall overhead
+pub const RELAY_BUFFER_SIZE: usize = 512 * 1024;
 
 /// Maximum frame payload that fits within a single Noise Protocol message
 /// AND within the u16 wire length prefix (max 65535 bytes on the wire).
@@ -74,14 +74,14 @@ pub const RELAY_BUFFER_SIZE: usize = 128 * 1024;
 /// corrupting the wire stream and killing downloads.
 pub const MAX_FRAME_PAYLOAD: usize = 65535 - 16 - FRAME_HEADER_SIZE - 1;
 
-/// TLS BufWriter capacity — 64KB for write coalescing
-pub const TLS_BUFWRITER_CAPACITY: usize = 64 * 1024;
+/// TLS BufWriter capacity — 256KB for write coalescing
+pub const TLS_BUFWRITER_CAPACITY: usize = 256 * 1024;
 
 /// Maximum window size for BDP auto-tuning (16MB)
 pub const MAX_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 
-/// Initial window size for new streams with BDP auto-tuning (1MB — grows via measurement)
-pub const INITIAL_WINDOW_SIZE: u32 = 1 * 1024 * 1024;
+/// Initial window size for new streams with BDP auto-tuning (4MB — grows via measurement)
+pub const INITIAL_WINDOW_SIZE: u32 = 4 * 1024 * 1024;
 
 /// BDP estimator for dynamic flow control window sizing.
 ///

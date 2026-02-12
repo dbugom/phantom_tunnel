@@ -148,13 +148,13 @@ impl TunnelStream {
     }
 
     /// Get window update amount (if needed).
-    /// Sends update when 50% of the window is consumed — more aggressive than
-    /// the previous 50% threshold to keep the pipeline full on high-RTT links.
+    /// Sends update when 25% of the window is consumed — aggressive threshold
+    /// keeps the sender's window from starving on high-RTT links.
     pub fn window_update_needed(&self) -> Option<u32> {
         let initial = DEFAULT_WINDOW_SIZE;
         let consumed = initial.saturating_sub(self.recv_window);
-        // Update when 50% consumed
-        if consumed as f32 >= initial as f32 * 0.5 {
+        // Update when 25% consumed — more frequent updates prevent sender stalls
+        if consumed >= initial / 4 {
             Some(consumed)
         } else {
             None

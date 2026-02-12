@@ -11,7 +11,7 @@ use clap::Parser;
 use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
-    tunnel::{Frame, FrameType, Multiplexer},
+    tunnel::{Frame, FrameType, Multiplexer, BdpEstimator},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -474,6 +474,9 @@ where
     let mut pong_pending = false;
     let mut missed_pongs: u32 = 0;
 
+    // BDP estimator for measuring throughput
+    let mut bdp = BdpEstimator::new();
+
     loop {
         tokio::select! {
             // Periodic cleanup of expired draining streams
@@ -559,6 +562,16 @@ where
                             FrameType::Data => {
                                 // Forward data to appropriate stream handler
                                 let stream_id = frame.stream_id;
+                                let payload_len = frame.payload.len() as u32;
+
+                                // BDP measurement: track bytes received
+                                if bdp.on_data_received(payload_len) {
+                                    let ping_frame = Frame::ping(0);
+                                    let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                                    write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                    trace!("BDP measurement PING sent");
+                                }
+
                                 if let Some(active) = active_streams.get(&stream_id) {
                                     if active.draining_since.is_some() {
                                         // Stream is draining - silently drop
@@ -569,6 +582,9 @@ where
                                         if let Some(stream) = active_streams.get_mut(&stream_id) {
                                             stream.draining_since = Some(Instant::now());
                                         }
+                                    } else {
+                                        // Track flow control: consume recv_window, queue WindowUpdate
+                                        mux.track_recv_data(stream_id, payload_len);
                                     }
                                 } else {
                                     // Unknown stream - likely already cleaned up
@@ -590,6 +606,8 @@ where
                                 pong_pending = false;
                                 missed_pongs = 0;
                                 last_pong = Instant::now();
+                                // BDP measurement: compute throughput on PONG
+                                bdp.on_pong_received();
                                 debug!("Keepalive PONG received from client");
                             }
                             FrameType::Ping => {

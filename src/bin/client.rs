@@ -12,7 +12,7 @@ use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
     obfuscation::BrowserProfile,
-    tunnel::{Frame, FrameType, Multiplexer},
+    tunnel::{Frame, FrameType, Multiplexer, BdpEstimator},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -523,6 +523,9 @@ where
     let mut pong_pending = false;
     let mut missed_pongs: u32 = 0;
 
+    // BDP estimator for measuring throughput
+    let mut bdp = BdpEstimator::new();
+
     loop {
         tokio::select! {
             // Periodic cleanup of expired draining streams
@@ -581,6 +584,14 @@ where
 
                             // Handle data frames specially - forward to stream handler
                             if frame.frame_type == FrameType::Data {
+                                // BDP measurement: track bytes received
+                                if bdp.on_data_received(frame.payload.len() as u32) {
+                                    let ping_frame = Frame::ping(0);
+                                    let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                                    write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                    trace!("BDP measurement PING sent");
+                                }
+
                                 if let Some(active) = active_streams.get(&frame.stream_id) {
                                     if active.draining_since.is_some() {
                                         // Stream is draining - silently drop data (in-flight from server)
@@ -621,6 +632,8 @@ where
                                 pong_pending = false;
                                 missed_pongs = 0;
                                 last_pong = Instant::now();
+                                // BDP measurement: compute throughput on PONG
+                                bdp.on_pong_received();
                                 debug!("Keepalive PONG received");
                             } else if frame.frame_type == FrameType::Ping {
                                 // Respond to server pings
