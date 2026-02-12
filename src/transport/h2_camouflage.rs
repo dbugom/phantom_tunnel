@@ -26,15 +26,15 @@ const CONNECT_AUTHORITY: &str = "api.google.com:443";
 // AsyncRead adapter (channel-based, for H2 RecvStream)
 // ============================================================
 
-/// AsyncRead adapter backed by an mpsc channel receiving Bytes from H2 RecvStream.
-/// The channel is needed because h2::RecvStream::data() is async-only (no poll variant).
+/// AsyncRead adapter backed by an unbounded mpsc channel receiving Bytes from H2 RecvStream.
+/// Unbounded so the H2 recv task never blocks — H2 flow control limits data on the wire.
 pub struct ChannelReader {
-    rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::UnboundedReceiver<Bytes>,
     buf: BytesMut,
 }
 
 impl ChannelReader {
-    pub fn new(rx: mpsc::Receiver<Bytes>) -> Self {
+    pub fn new(rx: mpsc::UnboundedReceiver<Bytes>) -> Self {
         Self {
             rx,
             buf: BytesMut::new(),
@@ -299,15 +299,17 @@ fn h2_to_async_io(
     h2_send: h2::SendStream<Bytes>,
     mut h2_recv: RecvStream,
 ) -> anyhow::Result<(ChannelReader, H2Writer)> {
-    // Read side: H2 recv -> channel -> AsyncRead
-    let (read_tx, read_rx) = mpsc::channel::<Bytes>(256);
+    // Read side: H2 recv -> unbounded channel -> AsyncRead
+    // Unbounded so this task never blocks on send — H2 flow control on the wire
+    // limits how much data can be in-flight, bounding memory naturally.
+    let (read_tx, read_rx) = mpsc::unbounded_channel::<Bytes>();
     tokio::spawn(async move {
         loop {
             match h2_recv.data().await {
                 Some(Ok(data)) => {
                     // Release flow control capacity immediately
                     let _ = h2_recv.flow_control().release_capacity(data.len());
-                    if read_tx.send(data).await.is_err() {
+                    if read_tx.send(data).is_err() {
                         break;
                     }
                 }
