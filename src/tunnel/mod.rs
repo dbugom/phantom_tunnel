@@ -50,11 +50,13 @@ pub const MAX_STREAMS: u32 = 1024;
 /// 16MB / 100ms RTT = 160 MB/s ≈ 1.28 Gbps theoretical max
 pub const DEFAULT_WINDOW_SIZE: u32 = 16 * 1024 * 1024;
 
-/// Keepalive interval — send Ping every 20 seconds to detect dead connections
-pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
+/// Keepalive interval — send Ping every 30 seconds to detect dead connections.
+/// Must be generous enough that pongs queued behind data frames still arrive in time.
+pub const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Maximum missed Pong responses before declaring the tunnel dead
-pub const MAX_MISSED_PONGS: u32 = 2;
+/// Maximum missed Pong responses before declaring the tunnel dead.
+/// 3 × 30s = 90s grace — tolerates pong delays during heavy transfers.
+pub const MAX_MISSED_PONGS: u32 = 3;
 
 /// Relay read buffer size — 512KB for amortizing syscall overhead
 pub const RELAY_BUFFER_SIZE: usize = 512 * 1024;
