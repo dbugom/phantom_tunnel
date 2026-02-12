@@ -67,7 +67,7 @@ enum StreamToTunnel {
 
 /// Active stream with channel to send data to it
 struct ActiveStream {
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
     /// If Some, the stream is draining (closed by client, waiting for cleanup)
     draining_since: Option<Instant>,
 }
@@ -491,8 +491,9 @@ where
 
                                         info!("Opening stream {} to {}", stream_id, destination);
 
-                                        // Create channel for sending data to this stream
-                                        let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(256);
+                                        // Unbounded channel: never blocks the main loop when
+                                        // the destination is slow to consume data
+                                        let (data_tx, data_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
                                         active_streams.insert(stream_id, ActiveStream {
                                             data_tx,
                                             draining_since: None,
@@ -519,7 +520,7 @@ where
                                     if active.draining_since.is_some() {
                                         // Stream is draining - silently drop
                                         trace!("Dropping data for draining stream {}", stream_id);
-                                    } else if active.data_tx.send(frame.payload).await.is_err() {
+                                    } else if active.data_tx.send(frame.payload).is_err() {
                                         // Stream handler closed - mark as draining instead of removing
                                         debug!("Stream {} handler closed, marking as draining", stream_id);
                                         if let Some(stream) = active_streams.get_mut(&stream_id) {
@@ -837,7 +838,7 @@ async fn send_frame(
 async fn handle_stream(
     stream_id: u32,
     destination: String,
-    mut data_rx: mpsc::Receiver<bytes::Bytes>,
+    mut data_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
     tunnel_tx: mpsc::Sender<StreamToTunnel>,
 ) -> Result<()> {
     // Connect to destination
