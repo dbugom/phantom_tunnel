@@ -508,6 +508,12 @@ where
             Some(msg) = reader_rx.recv() => {
                 match msg {
                     ReaderMessage::Frame(encrypted_data) => {
+                        // Any received frame proves the connection is alive.
+                        // Reset keepalive counters here — pong responses get stuck
+                        // behind data frames in the write queue during heavy transfers.
+                        missed_pongs = 0;
+                        last_pong = Instant::now();
+
                         // Decrypt frame
                         let plaintext_len = match noise_transport.decrypt(&encrypted_data, &mut frame_buf) {
                             Ok(len) => len,
