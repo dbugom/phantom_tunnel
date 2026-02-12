@@ -16,7 +16,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+use super::probe_resistance;
 
 /// Target authority for the CONNECT request.
 /// This should look like a legitimate destination to DPI.
@@ -239,12 +241,9 @@ where
         let (request, mut respond) = result;
 
         if request.method() != Method::CONNECT {
-            // Not a CONNECT — respond with 404 (looks like a normal web server)
-            let response = http::Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(())
-                .unwrap();
-            respond.send_response(response, true)?;
+            // Not a CONNECT — serve realistic decoy page (looks like nginx)
+            warn!("Non-CONNECT request (possible probe): {} {}", request.method(), request.uri());
+            serve_decoy_response(request.method(), request.uri().path(), respond)?;
             continue;
         }
 
@@ -267,13 +266,9 @@ where
     tokio::spawn(async move {
         while let Some(result) = connection.accept().await {
             match result {
-                Ok((_req, mut respond)) => {
-                    // Reject any additional streams with 404
-                    let response = http::Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(())
-                        .unwrap();
-                    let _ = respond.send_response(response, true);
+                Ok((req, respond)) => {
+                    // Serve decoy page for any additional requests
+                    let _ = serve_decoy_response(req.method(), req.uri().path(), respond);
                 }
                 Err(e) => {
                     debug!("H2 server connection driver error: {e}");
@@ -285,6 +280,57 @@ where
 
     let (reader, writer) = h2_to_async_io(send_stream, recv_stream)?;
     Ok(Some((reader, writer)))
+}
+
+// ============================================================
+// Decoy response for non-CONNECT requests
+// ============================================================
+
+/// Serve a realistic nginx-like response for non-CONNECT requests.
+/// Makes the server indistinguishable from a normal web server to probers.
+fn serve_decoy_response(
+    method: &Method,
+    path: &str,
+    mut respond: h2::server::SendResponse<Bytes>,
+) -> anyhow::Result<()> {
+    let server_header = "nginx/1.24.0";
+
+    match *method {
+        Method::GET | Method::HEAD => {
+            let (status, body_html) = if path == "/" {
+                (StatusCode::OK, probe_resistance::decoy_index_html())
+            } else {
+                (StatusCode::NOT_FOUND, probe_resistance::decoy_404_html())
+            };
+
+            let response = http::Response::builder()
+                .status(status)
+                .header("server", server_header)
+                .header("content-type", "text/html")
+                .header("content-length", body_html.len().to_string())
+                .body(())
+                .unwrap();
+
+            let is_head = *method == Method::HEAD;
+            let mut send_stream = respond.send_response(response, is_head)?;
+            if !is_head {
+                send_stream.send_data(Bytes::from(body_html), true)?;
+            }
+        }
+        _ => {
+            // POST, PUT, DELETE, etc → 405 Method Not Allowed
+            let response = http::Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("server", server_header)
+                .header("allow", "GET, HEAD")
+                .header("content-length", "0")
+                .body(())
+                .unwrap();
+            respond.send_response(response, true)?;
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================

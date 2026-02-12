@@ -55,6 +55,8 @@ struct ServerState {
     allowed_clients: HashSet<String>,
     /// Connection semaphore for limiting concurrent connections
     conn_semaphore: Semaphore,
+    /// Decoy backend address for active probing resistance
+    decoy_backend: Option<String>,
 }
 
 /// Command to send data back through the tunnel
@@ -147,6 +149,7 @@ async fn main() -> Result<()> {
         keypair,
         allowed_clients,
         conn_semaphore: Semaphore::new(server_config.max_connections),
+        decoy_backend: server_config.decoy_backend.clone(),
     });
 
     // Build TLS acceptor if cert/key are configured
@@ -296,6 +299,7 @@ async fn handle_connection(
 ) -> Result<()> {
     // Acquire connection permit (clone Arc first so we can move state into inner fn)
     let inner_state = Arc::clone(&state);
+    let decoy_backend = state.decoy_backend.clone();
     let _permit = state
         .conn_semaphore
         .acquire()
@@ -319,25 +323,29 @@ async fn handle_connection(
             match phantom_tunnel::transport::h2_camouflage::server_h2_accept(tls_stream).await {
                 Ok(Some((h2_reader, h2_writer))) => {
                     debug!("H2 CONNECT accepted, proceeding with Noise handshake");
-                    return handle_connection_inner(h2_reader, h2_writer, inner_state).await;
+                    return handle_connection_inner(h2_reader, h2_writer, inner_state, decoy_backend.clone()).await;
                 }
                 Ok(None) => {
-                    debug!("No valid CONNECT request (possible probe)");
+                    warn!("No CONNECT request received (possible probe)");
                     return Ok(());
                 }
                 Err(e) => {
-                    debug!("H2 handshake failed (possible probe): {}", e);
+                    warn!("H2 handshake failed (possible probe): {}", e);
+                    // Hold connection open — timing resistance.
+                    // The TLS stream is consumed by h2 so we can't proxy to decoy,
+                    // but sleeping avoids instant-drop fingerprinting.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
                     return Ok(());
                 }
             }
         }
 
         let (read_half, write_half) = tokio::io::split(tls_stream);
-        handle_connection_inner(read_half, write_half, inner_state).await
+        handle_connection_inner(read_half, write_half, inner_state, decoy_backend).await
     } else {
         // Raw TCP (backward compat)
         let (read_half, write_half) = stream.into_split();
-        handle_connection_inner(read_half, write_half, inner_state).await
+        handle_connection_inner(read_half, write_half, inner_state, decoy_backend).await
     }
 }
 
@@ -346,6 +354,7 @@ async fn handle_connection_inner<R, W>(
     mut read_half: R,
     write_half: W,
     state: Arc<ServerState>,
+    _decoy_backend: Option<String>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -362,7 +371,10 @@ where
     let client_key_b64 = client_public.to_base64();
     if !state.allowed_clients.is_empty() && !state.allowed_clients.contains(&client_key_b64) {
         warn!("Rejected unknown client: {}...", &client_key_b64[..16]);
-        return Err(anyhow!("Client not in allowed list"));
+        // Hold connection open for timing resistance instead of dropping immediately.
+        // An instant close on auth failure is distinguishable from a normal web server.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        return Ok(());
     }
 
     info!("Client connected: {}...", &client_key_b64[..16]);
