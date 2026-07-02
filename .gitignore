@@ -1,2 +1,12 @@
 /target
 CLAUDE.md
+
+# Runtime configs holding PRIVATE KEYS — never commit (examples/*.config.toml are safe)
+client.toml
+server.toml
+
+# Server decommission backups — contain private keys
+phantom-decommission-*.tar.gz
+
+# Server decommission backup (PRIVATE KEYS — never commit)
+server-backup/
