@@ -1,9 +1,8 @@
 //! Multiplexed stream implementation
 
-use super::{Frame, FrameType, TunnelError, DEFAULT_WINDOW_SIZE};
-use bytes::{Bytes, BytesMut};
+use super::{TunnelError, DEFAULT_WINDOW_SIZE};
+use bytes::Bytes;
 use std::collections::VecDeque;
-use tokio::sync::mpsc;
 
 /// Stream state
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,11 +147,15 @@ impl TunnelStream {
         !self.recv_buffer.is_empty()
     }
 
-    /// Get window update amount (if needed)
+    /// Get window update amount (if needed).
+    /// Sends update when 50% of the window is consumed — more aggressive than
+    /// the previous 50% threshold to keep the pipeline full on high-RTT links.
     pub fn window_update_needed(&self) -> Option<u32> {
-        let threshold = DEFAULT_WINDOW_SIZE / 2;
-        if self.recv_window < threshold {
-            Some(DEFAULT_WINDOW_SIZE - self.recv_window)
+        let initial = DEFAULT_WINDOW_SIZE;
+        let consumed = initial.saturating_sub(self.recv_window);
+        // Update when 50% consumed
+        if consumed as f32 >= initial as f32 * 0.5 {
+            Some(consumed)
         } else {
             None
         }

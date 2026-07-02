@@ -11,9 +11,10 @@ mod aead;
 mod handshake;
 mod kdf;
 mod keys;
+pub mod session_cache;
 
 pub use aead::{decrypt_length, encrypt_length, Cipher};
-pub use handshake::{HandshakeRole, NoiseHandshake, NoiseTransport};
+pub use handshake::{noise_pattern_for_cipher, HandshakeRole, NoiseHandshake, NoiseTransport};
 pub use kdf::{derive_length_key, derive_session_keys, Hkdf};
 pub use keys::{KeyPair, PrivateKey, PublicKey};
 
@@ -22,7 +23,10 @@ use thiserror::Error;
 /// Noise Protocol pattern used for handshake
 /// IK: Client knows server's static public key
 /// Provides mutual authentication and forward secrecy
-pub const NOISE_PATTERN: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
+pub const NOISE_PATTERN: &str = "Noise_IK_25519_AESGCM_SHA256";
+
+/// Fallback Noise Pattern using ChaCha20-Poly1305 (fast on ARM without AES-NI)
+pub const NOISE_PATTERN_CHACHA: &str = "Noise_IK_25519_ChaChaPoly_SHA256";
 
 /// Length of symmetric key in bytes
 pub const KEY_LEN: usize = 32;

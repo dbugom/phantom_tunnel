@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
             let key = load_private_key(&key_path)
                 .context("Failed to load TLS private key")?;
 
-            let tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            let mut tls_config = rustls::ServerConfig::builder_with_provider(Arc::new(
                     rustls::crypto::ring::default_provider(),
                 ))
                 .with_safe_default_protocol_versions()
@@ -165,6 +165,9 @@ async fn main() -> Result<()> {
                 .with_no_client_auth()
                 .with_single_cert(certs, key)
                 .context("Failed to build TLS server config")?;
+
+            // ALPN h2 — critical for HTTP/2 CONNECT camouflage
+            tls_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
             info!("TLS enabled with cert: {}", cert_path);
             Some(Arc::new(tokio_rustls::TlsAcceptor::from(Arc::new(tls_config))))
@@ -182,6 +185,11 @@ async fn main() -> Result<()> {
     info!("Phantom Tunnel Server v{}", phantom_tunnel::VERSION);
     info!("Listening on {}", listen_addr);
     info!("Server public key: {}", state.keypair.public.to_base64());
+    info!("Noise cipher: AESGCM (AES-256-GCM)");
+    let h2_camouflage_enabled = server_config.h2_camouflage && tls_acceptor.is_some();
+    if h2_camouflage_enabled {
+        info!("H2 CONNECT camouflage: enabled");
+    }
 
     let listener = TcpListener::bind(&listen_addr)
         .await
@@ -197,8 +205,9 @@ async fn main() -> Result<()> {
 
                         let state = Arc::clone(&state);
                         let acceptor = tls_acceptor.clone();
+                        let h2_cam = h2_camouflage_enabled;
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(stream, state, acceptor).await {
+                            if let Err(e) = handle_connection(stream, state, acceptor, h2_cam).await {
                                 debug!("Connection error: {}", e);
                             }
                         });
@@ -283,6 +292,7 @@ async fn handle_connection(
     stream: TcpStream,
     state: Arc<ServerState>,
     tls_acceptor: Option<Arc<tokio_rustls::TlsAcceptor>>,
+    h2_camouflage: bool,
 ) -> Result<()> {
     // Acquire connection permit (clone Arc first so we can move state into inner fn)
     let inner_state = Arc::clone(&state);
@@ -292,8 +302,9 @@ async fn handle_connection(
         .await
         .context("Failed to acquire connection permit")?;
 
-    // Disable Nagle's algorithm to avoid delays on small writes (control frames, length prefixes)
-    stream.set_nodelay(true)?;
+    // Apply TCP optimizations: BBR, large buffers, NODELAY, QUICKACK
+    phantom_tunnel::transport::tcp_tuning::optimize_tcp_stream(&stream)?;
+    phantom_tunnel::transport::tcp_tuning::set_tcp_keepalive(&stream)?;
 
     if let Some(acceptor) = tls_acceptor {
         // TLS wrapping enabled
@@ -301,6 +312,25 @@ async fn handle_connection(
             .await
             .context("TLS accept failed")?;
         debug!("TLS handshake complete with client");
+
+        // HTTP/2 CONNECT camouflage (when enabled, Noise tunnel is wrapped in H2 DATA frames)
+        #[cfg(feature = "h2-camouflage")]
+        if h2_camouflage {
+            match phantom_tunnel::transport::h2_camouflage::server_h2_accept(tls_stream).await {
+                Ok(Some((h2_reader, h2_writer))) => {
+                    debug!("H2 CONNECT accepted, proceeding with Noise handshake");
+                    return handle_connection_inner(h2_reader, h2_writer, inner_state).await;
+                }
+                Ok(None) => {
+                    debug!("No valid CONNECT request (possible probe)");
+                    return Ok(());
+                }
+                Err(e) => {
+                    debug!("H2 handshake failed (possible probe): {}", e);
+                    return Ok(());
+                }
+            }
+        }
 
         let (read_half, write_half) = tokio::io::split(tls_stream);
         handle_connection_inner(read_half, write_half, inner_state).await
@@ -322,7 +352,7 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     // Wrap writer in BufWriter to coalesce small writes into fewer TLS records
-    let mut write_half = tokio::io::BufWriter::new(write_half);
+    let mut write_half = tokio::io::BufWriter::with_capacity(phantom_tunnel::tunnel::TLS_BUFWRITER_CAPACITY, write_half);
 
     // Perform Noise handshake
     let (mut noise_transport, client_public) =
@@ -393,6 +423,13 @@ where
     // Interval for cleaning up expired draining streams
     let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
     cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Keepalive: Ping/Pong to detect dead connections
+    let mut keepalive_timer = tokio::time::interval(phantom_tunnel::tunnel::KEEPALIVE_INTERVAL);
+    keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_pong = Instant::now();
+    let mut pong_pending = false;
+    let mut missed_pongs: u32 = 0;
 
     loop {
         tokio::select! {
@@ -505,6 +542,19 @@ where
                                 }
                                 let _ = mux.handle_frame(frame).await;
                             }
+                            FrameType::Pong => {
+                                pong_pending = false;
+                                missed_pongs = 0;
+                                last_pong = Instant::now();
+                                debug!("Keepalive PONG received from client");
+                            }
+                            FrameType::Ping => {
+                                // Respond to client pings
+                                let pong_frame = Frame::pong(0);
+                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &pong_frame, &mut encrypt_buf).await?;
+                                write_half.flush().await?;
+                                debug!("Keepalive PONG sent in response to PING");
+                            }
                             _ => {
                                 // Handle other frames through multiplexer
                                 let _ = mux.handle_frame(frame).await;
@@ -533,8 +583,16 @@ where
                             .unwrap_or(true);
 
                         if !is_draining {
-                            let frame = Frame::data(stream_id, data);
-                            send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                            // Split into chunks that fit within Noise's 65535-byte message limit
+                            let max_payload = phantom_tunnel::tunnel::MAX_FRAME_PAYLOAD;
+                            let mut offset = 0;
+                            while offset < data.len() {
+                                let end = std::cmp::min(offset + max_payload, data.len());
+                                let chunk = data.slice(offset..end);
+                                let frame = Frame::data(stream_id, chunk);
+                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                                offset = end;
+                            }
                             write_half.flush().await?;
                         } else {
                             trace!("Dropping outbound data for draining stream {}", stream_id);
@@ -553,6 +611,24 @@ where
                 }
             }
 
+            // Keepalive timer
+            _ = keepalive_timer.tick() => {
+                if pong_pending {
+                    missed_pongs += 1;
+                    warn!("Missed pong #{} (last pong: {:?} ago)", missed_pongs, last_pong.elapsed());
+                    if missed_pongs >= phantom_tunnel::tunnel::MAX_MISSED_PONGS {
+                        error!("Keepalive timeout -- {} missed pongs, closing connection", phantom_tunnel::tunnel::MAX_MISSED_PONGS);
+                        break;
+                    }
+                }
+                // Send Ping
+                let ping_frame = Frame::ping(0);
+                send_frame_write_buffered(&mut write_half, &mut noise_transport, &ping_frame, &mut encrypt_buf).await?;
+                write_half.flush().await?;
+                pong_pending = true;
+                debug!("Keepalive PING sent");
+            }
+
             // Shutdown
             else => {
                 break;
@@ -569,7 +645,7 @@ where
                 .map(|s| s.draining_since.is_some())
                 .unwrap_or(false);
 
-            if !is_draining {
+            if !is_draining || frame.frame_type == FrameType::StreamClose {
                 send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
             }
         }
@@ -767,8 +843,8 @@ async fn handle_stream(
     // Connect to destination
     let target = match TcpStream::connect(&destination).await {
         Ok(t) => {
-            // Disable Nagle's algorithm on destination connection too
-            let _ = t.set_nodelay(true);
+            // Apply TCP optimizations on destination connection too
+            let _ = phantom_tunnel::transport::tcp_tuning::optimize_tcp_stream(&t);
             info!("Stream {} connected to {}", stream_id, destination);
             t
         }
@@ -784,9 +860,8 @@ async fn handle_stream(
     let tunnel_tx_clone = tunnel_tx.clone();
 
     // Task to read from target and send to tunnel
-    let target_to_tunnel = tokio::spawn(async move {
-        // Max payload: Noise transport limit (65535) - AEAD tag (16) - frame header (7) = 65512
-        let mut buf = vec![0u8; 65512];
+    let mut target_to_tunnel = tokio::spawn(async move {
+        let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
         loop {
             match target_read.read(&mut buf).await {
                 Ok(0) => {
@@ -810,7 +885,7 @@ async fn handle_stream(
     });
 
     // Task to read from tunnel and send to target
-    let tunnel_to_target = tokio::spawn(async move {
+    let mut tunnel_to_target = tokio::spawn(async move {
         while let Some(data) = data_rx.recv().await {
             if target_write.write_all(&data).await.is_err() {
                 break;
@@ -818,10 +893,14 @@ async fn handle_stream(
         }
     });
 
-    // Wait for either direction to complete
+    // Wait for either direction to complete, then abort the other
     tokio::select! {
-        _ = target_to_tunnel => {}
-        _ = tunnel_to_target => {}
+        _ = &mut target_to_tunnel => {
+            tunnel_to_target.abort();
+        }
+        _ = &mut tunnel_to_target => {
+            target_to_tunnel.abort();
+        }
     }
 
     Ok(())
