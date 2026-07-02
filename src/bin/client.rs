@@ -12,15 +12,19 @@ use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
     obfuscation::BrowserProfile,
-    tunnel::{Frame, FrameType, Multiplexer},
+    tunnel::{Frame, FrameType, Multiplexer, BdpEstimator},
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
+
+/// Grace period for draining streams before full removal (allows in-flight data to arrive)
+/// Reduced from 5s to 1s to prevent file descriptor exhaustion under heavy load
+const STREAM_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Phantom Tunnel Client - Secure, censorship-resistant tunnel
 #[derive(Parser, Debug)]
@@ -67,9 +71,10 @@ struct ClientState {
     server_addr: String,
     /// Browser profile
     profile: BrowserProfile,
-    /// SNI for TLS (reserved for future TLS transport)
-    #[allow(dead_code)]
-    sni: String,
+    /// SNI for TLS wrapping (None = raw TCP, Some = TLS wrapping enabled)
+    tls_sni: Option<String>,
+    /// Enable HTTP/2 CONNECT camouflage
+    h2_camouflage: bool,
 }
 
 /// Request to open a new stream through the tunnel
@@ -82,8 +87,10 @@ struct OpenStreamRequest {
 struct StreamConnection {
     stream_id: u32,
     #[allow(dead_code)] // Kept for symmetry, sending uses TunnelCommand::SendData
-    data_tx: mpsc::Sender<bytes::Bytes>,
-    data_rx: mpsc::Receiver<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
+    data_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
+    /// Cloned tunnel command sender, captured at stream-open time for relay tasks
+    cmd_tx: mpsc::UnboundedSender<TunnelCommand>,
 }
 
 /// Tunnel command sent from proxy handlers to tunnel task
@@ -98,7 +105,7 @@ enum TunnelCommand {
 
 /// Shared tunnel handle for proxy handlers
 struct TunnelHandle {
-    cmd_tx: mpsc::Sender<TunnelCommand>,
+    cmd_tx: Arc<std::sync::RwLock<mpsc::UnboundedSender<TunnelCommand>>>,
 }
 
 impl TunnelHandle {
@@ -106,12 +113,11 @@ impl TunnelHandle {
     async fn open_stream(&self, destination: String) -> Result<StreamConnection, String> {
         let (response_tx, response_rx) = oneshot::channel();
 
-        self.cmd_tx
-            .send(TunnelCommand::OpenStream(OpenStreamRequest {
+        let tx = self.cmd_tx.read().unwrap().clone();
+        tx.send(TunnelCommand::OpenStream(OpenStreamRequest {
                 destination,
                 response_tx,
             }))
-            .await
             .map_err(|_| "Tunnel disconnected".to_string())?;
 
         response_rx.await.map_err(|_| "Tunnel closed".to_string())?
@@ -206,43 +212,65 @@ async fn main() -> Result<()> {
         server_public,
         server_addr: args.server.unwrap_or(client_config.server),
         profile,
-        sni: client_config.tls_sni.unwrap_or_else(|| "www.google.com".to_string()),
+        tls_sni: client_config.tls_sni,
+        h2_camouflage: client_config.h2_camouflage,
     });
 
     info!("Phantom Tunnel Client v{}", phantom_tunnel::VERSION);
     info!("Server: {}", state.server_addr);
     info!("Browser profile: {:?}", state.profile);
+    if let Some(ref sni) = state.tls_sni {
+        info!("TLS wrapping enabled, SNI: {}", sni);
+    } else {
+        info!("TLS wrapping disabled (raw TCP)");
+    }
+    info!("Noise cipher: AESGCM (AES-256-GCM)");
+    if state.h2_camouflage && state.tls_sni.is_some() {
+        info!("H2 CONNECT camouflage: enabled");
+    }
     info!("Client public key: {}...", &state.keypair.public.to_base64()[..16]);
 
     // Start local proxies
     let socks5_addr = args.socks5.or(client_config.socks5_listen);
     let http_addr = args.http.or(client_config.http_listen);
 
-    // Create channel for tunnel commands
-    let (cmd_tx, cmd_rx) = mpsc::channel::<TunnelCommand>(256);
-    let tunnel_handle = Arc::new(TunnelHandle { cmd_tx });
+    // Create initial channel for tunnel commands (unbounded: never blocks relay tasks)
+    let (cmd_tx, _initial_rx) = mpsc::unbounded_channel::<TunnelCommand>();
+    let shared_tx = Arc::new(std::sync::RwLock::new(cmd_tx));
+    let tunnel_handle = Arc::new(TunnelHandle { cmd_tx: Arc::clone(&shared_tx) });
 
-    // Connect to server and run tunnel
+    // Connect to server and run tunnel with robust reconnection
     info!("Connecting to server...");
 
     let tunnel_state = Arc::clone(&state);
-    let tunnel_cmd_rx = cmd_rx;
-    let tunnel_task = tokio::spawn(async move {
-        loop {
-            match run_tunnel(Arc::clone(&tunnel_state), tunnel_cmd_rx).await {
-                Ok(_) => {
-                    info!("Tunnel closed normally");
-                    break;
+    let tunnel_task = tokio::spawn({
+        let shared_tx = Arc::clone(&shared_tx);
+        async move {
+            let mut consecutive_failures: u32 = 0;
+            loop {
+                // Create fresh channel for each connection attempt
+                let (new_tx, cmd_rx) = mpsc::unbounded_channel::<TunnelCommand>();
+                let cmd_tx_for_streams = new_tx.clone();
+                // Update the shared sender so new proxy connections use the new channel
+                *shared_tx.write().unwrap() = new_tx;
+
+                match run_tunnel(Arc::clone(&tunnel_state), cmd_rx, cmd_tx_for_streams).await {
+                    Ok(_) => {
+                        consecutive_failures = 0;
+                        info!("Tunnel disconnected gracefully, reconnecting...");
+                    }
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        error!("Tunnel error ({} consecutive): {:#}", consecutive_failures, e);
+                    }
                 }
-                Err(e) => {
-                    error!("Tunnel error: {}", e);
-                    info!("Reconnecting in 5 seconds...");
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
+
+                // Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (cap)
+                let base = std::cmp::min(30u64, 1u64 << consecutive_failures.min(5));
+                let delay = Duration::from_secs(base);
+                info!("Reconnecting in {:?}...", delay);
+                tokio::time::sleep(delay).await;
             }
-            // After reconnection attempt, we need a new receiver
-            // For now, just break - a more robust implementation would recreate the channel
-            break;
         }
     });
 
@@ -308,7 +336,9 @@ fn generate_keypair() -> Result<()> {
 
 /// Active stream state in the tunnel
 struct ActiveStream {
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
+    /// If Some, the stream is draining (closed by client, waiting for cleanup)
+    draining_since: Option<Instant>,
 }
 
 /// Message from the reader task
@@ -324,17 +354,70 @@ enum ReaderMessage {
 /// Run the tunnel connection to server
 async fn run_tunnel(
     state: Arc<ClientState>,
-    mut cmd_rx: mpsc::Receiver<TunnelCommand>,
+    cmd_rx: mpsc::UnboundedReceiver<TunnelCommand>,
+    cmd_tx_for_streams: mpsc::UnboundedSender<TunnelCommand>,
 ) -> Result<()> {
     // Connect to server
     let stream = TcpStream::connect(&state.server_addr)
         .await
         .context("Failed to connect to server")?;
 
+    // Apply TCP optimizations: BBR, large buffers, NODELAY, QUICKACK
+    phantom_tunnel::transport::tcp_tuning::optimize_tcp_stream(&stream)?;
+    phantom_tunnel::transport::tcp_tuning::set_tcp_keepalive(&stream)?;
+
     info!("Connected to server, performing handshake...");
 
-    // Split stream for handshake (we'll need both halves)
-    let (mut read_half, mut write_half) = stream.into_split();
+    // Wrap in TLS if configured, otherwise use raw TCP
+    if let Some(ref sni) = state.tls_sni {
+        // TLS wrapping enabled
+        let tls_config = phantom_tunnel::obfuscation::build_tls_config(
+            &phantom_tunnel::obfuscation::FingerprintConfig::new(state.profile, sni),
+        ).context("Failed to build TLS config")?;
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+        let server_name = rustls::pki_types::ServerName::try_from(sni.clone())
+            .map_err(|e| anyhow!("Invalid SNI '{}': {}", sni, e))?;
+        let tls_stream = connector.connect(server_name, stream)
+            .await
+            .context("TLS handshake failed")?;
+
+        info!("TLS handshake complete (SNI: {})", sni);
+
+        // HTTP/2 CONNECT camouflage (when enabled, wraps Noise tunnel in H2 DATA frames)
+        #[cfg(feature = "h2-camouflage")]
+        if state.h2_camouflage {
+            let (h2_reader, h2_writer) =
+                phantom_tunnel::transport::h2_camouflage::client_h2_connect(tls_stream)
+                    .await
+                    .context("H2 CONNECT camouflage failed")?;
+            info!("H2 CONNECT camouflage active");
+            return run_tunnel_inner(state, cmd_rx, cmd_tx_for_streams, h2_reader, h2_writer).await;
+        }
+
+        let (read_half, write_half) = tokio::io::split(tls_stream);
+        run_tunnel_inner(state, cmd_rx, cmd_tx_for_streams, read_half, write_half).await
+    } else {
+        // Raw TCP (backward compat)
+        let (read_half, write_half) = stream.into_split();
+        run_tunnel_inner(state, cmd_rx, cmd_tx_for_streams, read_half, write_half).await
+    }
+}
+
+/// Inner tunnel loop, generic over the transport read/write halves
+async fn run_tunnel_inner<R, W>(
+    state: Arc<ClientState>,
+    mut cmd_rx: mpsc::UnboundedReceiver<TunnelCommand>,
+    cmd_tx_for_streams: mpsc::UnboundedSender<TunnelCommand>,
+    mut read_half: R,
+    write_half: W,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Wrap writer in BufWriter to coalesce small writes into fewer TLS records
+    // (each raw write_all on a TLS stream creates a separate TLS record with 5+16 bytes overhead)
+    let mut write_half = tokio::io::BufWriter::with_capacity(phantom_tunnel::tunnel::TLS_BUFWRITER_CAPACITY, write_half);
 
     // Perform Noise handshake using both halves
     let mut noise_transport = match perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &state.server_public).await {
@@ -347,8 +430,36 @@ async fn run_tunnel(
 
     info!("Handshake complete, tunnel established");
 
+    // Spawn dedicated writer task — all I/O writes go through this task
+    // so the main select! loop never blocks on H2 flow control or slow TCP writes.
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (write_err_tx, mut write_err_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        // Batch writes: recv first message, drain all pending, flush once per batch
+        while let Some(data) = write_rx.recv().await {
+            if let Err(e) = write_half.write_all(&data).await {
+                let _ = write_err_tx.send(format!("write error: {}", e));
+                return;
+            }
+            // Drain all pending writes before flushing (reduces flush syscalls)
+            while let Ok(data) = write_rx.try_recv() {
+                if let Err(e) = write_half.write_all(&data).await {
+                    let _ = write_err_tx.send(format!("write error: {}", e));
+                    return;
+                }
+            }
+            if let Err(e) = write_half.flush().await {
+                let _ = write_err_tx.send(format!("flush error: {}", e));
+                return;
+            }
+        }
+    });
+
     // Create channel for reader task to send frames to main loop
-    let (reader_tx, mut reader_rx) = mpsc::channel::<ReaderMessage>(256);
+    // Unbounded: prevents reader task from blocking when main loop is busy
+    // writing to H2 (which can block on flow control). H2 flow control
+    // limits memory naturally.
+    let (reader_tx, mut reader_rx) = mpsc::unbounded_channel::<ReaderMessage>();
 
     // Spawn dedicated reader task - this will NOT be cancelled by select!
     tokio::spawn(async move {
@@ -358,28 +469,28 @@ async fn run_tunnel(
             let mut len_buf = [0u8; 2];
             if let Err(e) = read_half.read_exact(&mut len_buf).await {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    let _ = reader_tx.send(ReaderMessage::Closed).await;
+                    let _ = reader_tx.send(ReaderMessage::Closed);
                 } else {
-                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 }
                 break;
             }
 
             let frame_len = u16::from_be_bytes(len_buf) as usize;
             if frame_len > buf.len() {
-                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len))).await;
+                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len)));
                 break;
             }
 
             // Read frame data
             if let Err(e) = read_half.read_exact(&mut buf[..frame_len]).await {
-                let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 break;
             }
 
-            // Send complete frame to main loop
+            // Send complete frame to main loop (non-blocking)
             let frame_data = buf[..frame_len].to_vec();
-            if reader_tx.send(ReaderMessage::Frame(frame_data)).await.is_err() {
+            if reader_tx.send(ReaderMessage::Frame(frame_data)).is_err() {
                 break; // Main loop closed
             }
         }
@@ -391,16 +502,73 @@ async fn run_tunnel(
     // Track active streams: stream_id -> sender for incoming data
     let mut active_streams: HashMap<u32, ActiveStream> = HashMap::new();
 
-    // Buffer for decryption
+    // Buffer for decryption (reused to avoid allocations)
     let mut frame_buf = vec![0u8; 65536];
+
+    // Reusable encryption buffer (sized for max frame + AEAD tag)
+    let mut encrypt_buf = vec![0u8; 65536 + 16];
+
+    // Reusable wire buffer (avoids allocation per frame)
+    let mut wire_buf = Vec::with_capacity(65536 + 16 + 2);
+
+    // Interval for cleaning up expired draining streams
+    let mut cleanup_interval = tokio::time::interval(Duration::from_secs(1));
+    cleanup_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Track stream IDs for which we've already sent STREAM_CLOSE to avoid duplicates
+    let mut closed_streams_notified: HashSet<u32> = HashSet::new();
+
+    // Keepalive: Ping/Pong to detect dead connections
+    let mut keepalive_timer = tokio::time::interval(phantom_tunnel::tunnel::KEEPALIVE_INTERVAL);
+    keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_pong = Instant::now();
+    let mut pong_pending = false;
+    let mut missed_pongs: u32 = 0;
+
+    // BDP estimator for measuring throughput
+    let mut bdp = BdpEstimator::new();
 
     loop {
         tokio::select! {
+            // Periodic cleanup of expired draining streams
+            _ = cleanup_interval.tick() => {
+                let now = Instant::now();
+                let expired: Vec<u32> = active_streams
+                    .iter()
+                    .filter_map(|(&id, stream)| {
+                        if let Some(drain_start) = stream.draining_since {
+                            if now.duration_since(drain_start) >= STREAM_DRAIN_TIMEOUT {
+                                return Some(id);
+                            }
+                        }
+                        None
+                    })
+                    .collect();
+
+                for stream_id in expired {
+                    trace!("Removing expired draining stream {}", stream_id);
+                    active_streams.remove(&stream_id);
+                    // Also remove from multiplexer to free the stream slot
+                    mux.remove_stream(stream_id);
+                }
+
+                // Prune closed_streams_notified to prevent unbounded growth
+                // Keep only entries for streams that are still being referenced
+                if closed_streams_notified.len() > 1000 {
+                    closed_streams_notified.clear();
+                }
+            }
             // Receive frames from reader task
             Some(msg) = reader_rx.recv() => {
                 match msg {
                     ReaderMessage::Frame(encrypted_data) => {
                         debug!("Received encrypted frame: {} bytes", encrypted_data.len());
+
+                        // Any received frame proves the connection is alive.
+                        // Reset keepalive counters here — pong responses get stuck
+                        // behind data frames in the write queue during heavy transfers.
+                        missed_pongs = 0;
+                        last_pong = Instant::now();
 
                         // Decrypt frame
                         let plaintext_len = match noise_transport.decrypt(&encrypted_data, &mut frame_buf) {
@@ -418,23 +586,84 @@ async fn run_tunnel(
                             debug!("Decoded frame: type={:?} stream={} payload={} bytes",
                                    frame.frame_type, frame.stream_id, frame.payload.len());
 
+                            // Track whether mux.handle_frame() was already called
+                            // (Data frames call it early to prevent flow control deadlock)
+                            let mut mux_already_handled = false;
+
                             // Handle data frames specially - forward to stream handler
                             if frame.frame_type == FrameType::Data {
+                                // BDP measurement: track bytes received
+                                if bdp.on_data_received(frame.payload.len() as u32) {
+                                    let ping_frame = Frame::ping(0);
+                                    let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf, &mut wire_buf)?;
+                                    write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                    trace!("BDP measurement PING sent");
+                                }
+
                                 if let Some(active) = active_streams.get(&frame.stream_id) {
-                                    if active.data_tx.send(frame.payload.clone()).await.is_err() {
-                                        warn!("Failed to forward data to stream {}: channel closed", frame.stream_id);
+                                    if active.draining_since.is_some() {
+                                        // Stream is draining - silently drop data (in-flight from server)
+                                        trace!("Dropping data for draining stream {}: {} bytes",
+                                               frame.stream_id, frame.payload.len());
+                                    } else {
+                                        // Update flow control tracking before forwarding data.
+                                        // Uses unbounded channel so send() never blocks the main loop.
+                                        if let Err(e) = mux.handle_frame(frame.clone()).await {
+                                            debug!("Frame handling error: {}", e);
+                                        }
+                                        mux_already_handled = true;
+
+                                        // Forward data to the stream relay task (non-blocking)
+                                        if active.data_tx.send(frame.payload.clone()).is_err() {
+                                            // Channel closed - mark as draining instead of removing
+                                            debug!("Stream {} receiver closed, marking as draining", frame.stream_id);
+                                            if let Some(stream) = active_streams.get_mut(&frame.stream_id) {
+                                                stream.draining_since = Some(Instant::now());
+                                            }
+                                        }
                                     }
                                 } else {
-                                    warn!("Received data for unknown stream {}", frame.stream_id);
+                                    // Truly unknown stream - tell the server to stop sending
+                                    debug!("Received data for unknown stream {} ({} bytes)",
+                                           frame.stream_id, frame.payload.len());
+                                    if closed_streams_notified.insert(frame.stream_id) {
+                                        let close_frame = Frame::stream_close(frame.stream_id);
+                                        let wire = encrypt_frame_to_wire(&mut noise_transport, &close_frame, &mut encrypt_buf, &mut wire_buf)?;
+                                        write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                    }
                                 }
                             } else if frame.frame_type == FrameType::StreamClose {
                                 debug!("Server closed stream {}", frame.stream_id);
+                                // Server confirmed close - safe to remove immediately
                                 active_streams.remove(&frame.stream_id);
+                            } else if frame.frame_type == FrameType::Pong {
+                                pong_pending = false;
+                                missed_pongs = 0;
+                                last_pong = Instant::now();
+                                // BDP measurement: compute throughput on PONG
+                                bdp.on_pong_received();
+                                debug!("Keepalive PONG received");
+                            } else if frame.frame_type == FrameType::Ping {
+                                // Respond to server pings
+                                let pong_frame = Frame::pong(0);
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &pong_frame, &mut encrypt_buf, &mut wire_buf)?;
+                                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                debug!("Keepalive PONG sent in response to PING");
                             }
 
-                            // Let multiplexer handle frame for bookkeeping
-                            if let Err(e) = mux.handle_frame(frame).await {
-                                debug!("Frame handling error: {}", e);
+                            // Let multiplexer handle non-Data frames (StreamClose, Ping, Pong)
+                            // Data frames were already handled above before the channel send
+                            if !mux_already_handled {
+                                let is_draining = active_streams
+                                    .get(&frame.stream_id)
+                                    .map(|s| s.draining_since.is_some())
+                                    .unwrap_or(false);
+
+                                if !is_draining {
+                                    if let Err(e) = mux.handle_frame(frame).await {
+                                        debug!("Frame handling error: {}", e);
+                                    }
+                                }
                             }
                         }
                     }
@@ -464,10 +693,19 @@ async fn run_tunnel(
                                 // This ensures STREAM_OPEN arrives at server before any DATA frames
                                 let mut send_failed = false;
                                 for frame in mux.take_send_queue() {
-                                    if let Err(e) = send_frame_write(&mut write_half, &mut noise_transport, &frame).await {
-                                        error!("Failed to send STREAM_OPEN: {}", e);
-                                        send_failed = true;
-                                        break;
+                                    match encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf, &mut wire_buf) {
+                                        Ok(wire) => {
+                                            if write_tx.send(wire).is_err() {
+                                                error!("Failed to send STREAM_OPEN: writer task exited");
+                                                send_failed = true;
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to encrypt STREAM_OPEN: {}", e);
+                                            send_failed = true;
+                                            break;
+                                        }
                                     }
                                 }
 
@@ -476,17 +714,24 @@ async fn run_tunnel(
                                     continue;
                                 }
 
-                                // Create channels for this stream's data
-                                let (data_tx, data_rx) = mpsc::channel(256);
+                                // Unbounded channel: never blocks the main loop when
+                                // the downstream consumer (browser) is slow
+                                let (data_tx, data_rx) = mpsc::unbounded_channel();
 
                                 // Store the sender for incoming data
-                                active_streams.insert(stream_id, ActiveStream { data_tx: data_tx.clone() });
+                                active_streams.insert(stream_id, ActiveStream {
+                                    data_tx: data_tx.clone(),
+                                    draining_since: None,
+                                });
 
                                 // Send the connection back to the proxy handler
+                                // Clone the current cmd_tx so relay tasks can send data
+                                // even if the tunnel reconnects (old sender will just fail)
                                 let conn = StreamConnection {
                                     stream_id,
                                     data_tx,
                                     data_rx,
+                                    cmd_tx: cmd_tx_for_streams.clone(),
                                 };
 
                                 let _ = req.response_tx.send(Ok(conn));
@@ -497,17 +742,65 @@ async fn run_tunnel(
                         }
                     }
                     TunnelCommand::SendData { stream_id, data } => {
-                        // Send data frame
-                        let frame = Frame::data(stream_id, data);
-                        send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+                        // Only send if stream is not draining
+                        let is_draining = active_streams
+                            .get(&stream_id)
+                            .map(|s| s.draining_since.is_some())
+                            .unwrap_or(true); // Treat unknown streams as draining
+
+                        if !is_draining {
+                            // Split into chunks that fit within Noise's 65535-byte message limit
+                            let max_payload = phantom_tunnel::tunnel::MAX_FRAME_PAYLOAD;
+                            let mut offset = 0;
+                            while offset < data.len() {
+                                let end = std::cmp::min(offset + max_payload, data.len());
+                                let chunk = data.slice(offset..end);
+                                let frame = Frame::data(stream_id, chunk);
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf, &mut wire_buf)?;
+                                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                offset = end;
+                            }
+                        } else {
+                            trace!("Dropping send for draining/unknown stream {}", stream_id);
+                        }
                     }
                     TunnelCommand::CloseStream { stream_id } => {
-                        active_streams.remove(&stream_id);
-                        // Send close frame
-                        let frame = Frame::stream_close(stream_id);
-                        send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+                        // Mark stream as draining instead of removing immediately
+                        // This allows in-flight data from server to be handled gracefully
+                        if let Some(stream) = active_streams.get_mut(&stream_id) {
+                            if stream.draining_since.is_none() {
+                                debug!("Marking stream {} as draining", stream_id);
+                                stream.draining_since = Some(Instant::now());
+                            }
+                        }
+                        // Close local side in multiplexer (marks HalfClosedLocal, queues STREAM_CLOSE frame)
+                        mux.close_stream_local(stream_id);
                     }
                 }
+            }
+
+            // Keepalive timer
+            _ = keepalive_timer.tick() => {
+                if pong_pending {
+                    missed_pongs += 1;
+                    warn!("Missed pong #{} (last pong: {:?} ago)", missed_pongs, last_pong.elapsed());
+                    if missed_pongs >= phantom_tunnel::tunnel::MAX_MISSED_PONGS {
+                        error!("Keepalive timeout -- {} missed pongs, closing tunnel", phantom_tunnel::tunnel::MAX_MISSED_PONGS);
+                        break;
+                    }
+                }
+                // Send Ping
+                let ping_frame = Frame::ping(0);
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf, &mut wire_buf)?;
+                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                pong_pending = true;
+                debug!("Keepalive PING sent");
+            }
+
+            // Writer task error
+            Some(err) = write_err_rx.recv() => {
+                error!("Writer error: {}", err);
+                return Err(anyhow!("Writer error: {}", err));
             }
 
             // Shutdown signal
@@ -517,9 +810,18 @@ async fn run_tunnel(
             }
         }
 
-        // Send queued frames from multiplexer
+        // Send queued frames from multiplexer (e.g., WindowUpdate)
         for frame in mux.take_send_queue() {
-            send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+            // Don't send frames for draining streams
+            let is_draining = active_streams
+                .get(&frame.stream_id)
+                .map(|s| s.draining_since.is_some())
+                .unwrap_or(false);
+
+            if !is_draining || frame.frame_type == FrameType::StreamClose {
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf, &mut wire_buf)?;
+                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+            }
         }
     }
 
@@ -591,12 +893,16 @@ async fn send_frame(
 }
 
 /// Perform Noise IK handshake with split streams
-async fn perform_handshake_split(
-    read_half: &mut OwnedReadHalf,
-    write_half: &mut OwnedWriteHalf,
+async fn perform_handshake_split<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
     keypair: &KeyPair,
     server_public: &PublicKey,
-) -> Result<NoiseTransport> {
+) -> Result<NoiseTransport>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut handshake = NoiseHandshake::new_initiator(keypair, server_public)
         .context("Failed to create handshake")?;
 
@@ -611,6 +917,7 @@ async fn perform_handshake_split(
     let len_bytes = (len as u16).to_be_bytes();
     write_half.write_all(&len_bytes).await?;
     write_half.write_all(&buf[..len]).await?;
+    write_half.flush().await?;
 
     // Read response (<- e, ee, se)
     let mut len_buf = [0u8; 2];
@@ -632,8 +939,9 @@ async fn perform_handshake_split(
 }
 
 /// Send an encrypted frame using write half
-async fn send_frame_write(
-    write_half: &mut OwnedWriteHalf,
+#[allow(dead_code)]
+async fn send_frame_write<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
     noise: &mut NoiseTransport,
     frame: &Frame,
 ) -> Result<()> {
@@ -652,6 +960,76 @@ async fn send_frame_write(
     write_half.write_all(&ciphertext[..ct_len]).await?;
 
     Ok(())
+}
+
+/// Send an encrypted frame using write half with reusable buffer (reduces allocations)
+#[allow(dead_code)]
+async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
+    write_half: &mut W,
+    noise: &mut NoiseTransport,
+    frame: &Frame,
+    encrypt_buf: &mut Vec<u8>,
+) -> Result<()> {
+    let plaintext = frame.encode();
+
+    // Ensure buffer is large enough
+    let needed = plaintext.len() + 16;
+    if encrypt_buf.len() < needed {
+        encrypt_buf.resize(needed, 0);
+    }
+
+    let ct_len = noise
+        .encrypt(&plaintext, encrypt_buf)
+        .context("Failed to encrypt frame")?;
+
+    trace!("Sending frame type {:?} stream {} ({} bytes encrypted)",
+           frame.frame_type, frame.stream_id, ct_len);
+
+    // Coalesce length prefix + ciphertext into a single write to halve syscall overhead
+    let len_bytes = (ct_len as u16).to_be_bytes();
+    let mut wire_buf = Vec::with_capacity(2 + ct_len);
+    wire_buf.extend_from_slice(&len_bytes);
+    wire_buf.extend_from_slice(&encrypt_buf[..ct_len]);
+    write_half.write_all(&wire_buf).await?;
+
+    Ok(())
+}
+
+/// Encrypt a frame and return the wire bytes (2-byte length prefix + ciphertext).
+/// CPU-only, no I/O — safe to call from the main select! loop without blocking.
+fn encrypt_frame_to_wire(
+    noise: &mut NoiseTransport,
+    frame: &Frame,
+    encrypt_buf: &mut Vec<u8>,
+    wire_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>> {
+    let plaintext = frame.encode();
+
+    // Ensure buffer is large enough
+    let needed = plaintext.len() + 16;
+    if encrypt_buf.len() < needed {
+        encrypt_buf.resize(needed, 0);
+    }
+
+    let ct_len = noise
+        .encrypt(&plaintext, encrypt_buf)
+        .context("Failed to encrypt frame")?;
+
+    trace!("Encrypting frame type {:?} stream {} ({} bytes)",
+           frame.frame_type, frame.stream_id, ct_len);
+
+    // Build wire format: 2-byte BE length prefix + ciphertext
+    assert!(ct_len <= u16::MAX as usize,
+        "encrypted frame too large for u16 wire prefix: {} bytes (max {})",
+        ct_len, u16::MAX);
+    let len_bytes = (ct_len as u16).to_be_bytes();
+    wire_buf.clear();
+    wire_buf.reserve(2 + ct_len);
+    wire_buf.extend_from_slice(&len_bytes);
+    wire_buf.extend_from_slice(&encrypt_buf[..ct_len]);
+
+    // Return owned copy — wire_buf keeps its allocation for next call
+    Ok(wire_buf.clone())
 }
 
 /// Run local SOCKS5 proxy
@@ -754,20 +1132,21 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
             // Relay data bidirectionally
             let (mut client_read, mut client_write) = stream.into_split();
             let stream_id = conn.stream_id;
-            let tunnel_clone = Arc::clone(&tunnel);
+            // Use the cmd_tx captured at stream-open time (stable for this connection)
+            let stream_cmd_tx = conn.cmd_tx.clone();
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 32768];
+                let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break, // EOF
                         Ok(n) => {
                             let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                            if tunnel_clone.cmd_tx.send(TunnelCommand::SendData {
+                            if stream_cmd_tx.send(TunnelCommand::SendData {
                                 stream_id,
                                 data,
-                            }).await.is_err() {
+                            }).is_err() {
                                 break;
                             }
                         }
@@ -775,7 +1154,7 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
                     }
                 }
                 // Close the stream when client disconnects
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
+                let _ = stream_cmd_tx.send(TunnelCommand::CloseStream { stream_id });
             });
 
             // Task to read from tunnel and send to client
@@ -858,27 +1237,28 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
             // Relay data bidirectionally
             let (mut client_read, mut client_write) = stream.into_split();
             let stream_id = conn.stream_id;
-            let tunnel_clone = Arc::clone(&tunnel);
+            // Use the cmd_tx captured at stream-open time (stable for this connection)
+            let stream_cmd_tx = conn.cmd_tx.clone();
 
             // Task to read from client and send to tunnel
             let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 32768];
+                let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
                 loop {
                     match client_read.read(&mut buf).await {
                         Ok(0) => break,
                         Ok(n) => {
                             let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                            if tunnel_clone.cmd_tx.send(TunnelCommand::SendData {
+                            if stream_cmd_tx.send(TunnelCommand::SendData {
                                 stream_id,
                                 data,
-                            }).await.is_err() {
+                            }).is_err() {
                                 break;
                             }
                         }
                         Err(_) => break,
                     }
                 }
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
+                let _ = stream_cmd_tx.send(TunnelCommand::CloseStream { stream_id });
             });
 
             // Task to read from tunnel and send to client

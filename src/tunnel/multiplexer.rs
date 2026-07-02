@@ -207,10 +207,17 @@ impl Multiplexer {
             .get_mut(&stream_id)
             .ok_or(TunnelError::StreamNotFound(stream_id))?;
 
-        // Push data to stream buffer
-        state.stream.push_data(data.clone())?;
+        // Track received bytes for flow control (without buffering — data goes directly via channel)
+        let data_len = data.len() as u32;
+        if !state.stream.can_recv() {
+            return Err(TunnelError::StreamClosed);
+        }
+        if data_len > state.stream.recv_window() {
+            return Err(TunnelError::FlowControl);
+        }
+        state.stream.consume_recv_window(data_len);
 
-        // Notify stream handle
+        // Send data directly to stream handler via channel (no clone, no buffering)
         let _ = state.event_tx.send(StreamEvent::Data(data)).await;
 
         // Check if window update needed
@@ -314,7 +321,7 @@ impl Multiplexer {
         }
     }
 
-    /// Handle stream close
+    /// Handle stream close from remote
     async fn handle_stream_close(&mut self, stream_id: u32) -> Result<(), TunnelError> {
         if let Some(state) = self.streams.get_mut(&stream_id) {
             state.stream.close_remote();
@@ -325,6 +332,25 @@ impl Multiplexer {
             }
         }
         Ok(())
+    }
+
+    /// Close a stream locally (client-initiated close)
+    /// Marks the local side as closed and queues a STREAM_CLOSE frame.
+    /// If both sides are closed, removes the stream from the map.
+    pub fn close_stream_local(&mut self, stream_id: u32) {
+        if let Some(state) = self.streams.get_mut(&stream_id) {
+            state.stream.close_local();
+            self.send_queue.push(Frame::stream_close(stream_id));
+
+            if state.stream.is_closed() {
+                self.streams.remove(&stream_id);
+            }
+        }
+    }
+
+    /// Force-remove a stream from the multiplexer (for cleanup of zombie streams)
+    pub fn remove_stream(&mut self, stream_id: u32) {
+        self.streams.remove(&stream_id);
     }
 
     /// Handle window update
@@ -394,6 +420,20 @@ impl Multiplexer {
             }
         }
         Ok(())
+    }
+
+    /// Track received data for flow control without routing through event channel.
+    /// Consumes recv_window and queues WindowUpdate if needed.
+    /// Use this when the caller forwards data directly (not through mux event channels).
+    pub fn track_recv_data(&mut self, stream_id: u32, data_len: u32) {
+        if let Some(state) = self.streams.get_mut(&stream_id) {
+            state.stream.consume_recv_window(data_len);
+            if let Some(increment) = state.stream.window_update_needed() {
+                state.stream.apply_window_update(increment);
+                self.send_queue
+                    .push(Frame::window_update(stream_id, increment));
+            }
+        }
     }
 
     /// Get frames ready to send

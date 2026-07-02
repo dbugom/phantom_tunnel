@@ -1,0 +1,24 @@
+# Phantom Tunnel — Caddy reverse proxy for active probing resistance
+#
+# Caddy handles TLS termination and serves a real website for non-tunnel requests.
+# The phantom server listens on localhost:8443 without TLS (Caddy handles TLS).
+#
+# Usage:
+#   caddy run --config deploy/Caddyfile
+#
+# Note: When using this setup, configure phantom server WITHOUT tls_cert/tls_key
+# since Caddy handles TLS termination.
+
+phantom.yfy.ae {
+    tls /etc/letsencrypt/live/phantom.yfy.ae/fullchain.pem /etc/letsencrypt/live/phantom.yfy.ae/privkey.pem
+
+    # Reverse proxy all traffic to Phantom server
+    # (Phantom handles H2 CONNECT auth internally, rejects non-tunnel traffic)
+    reverse_proxy localhost:8443
+
+    # Fallback: serve a real website for non-tunnel requests
+    handle {
+        root * /var/www/phantom-decoy
+        file_server
+    }
+}

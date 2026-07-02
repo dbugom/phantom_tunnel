@@ -8,6 +8,15 @@
 use super::{CryptoError, KeyPair, PublicKey, NOISE_PATTERN};
 use snow::{Builder, HandshakeState, TransportState};
 
+
+/// Get the noise pattern string for the given cipher name
+pub fn noise_pattern_for_cipher(cipher: &str) -> &'static str {
+    match cipher {
+        "chacha" | "chachapoly" => super::NOISE_PATTERN_CHACHA,
+        "aesgcm" | _ => super::NOISE_PATTERN,
+    }
+}
+
 /// Role in the handshake
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HandshakeRole {
@@ -53,6 +62,47 @@ impl NoiseHandshake {
     /// * `local_keypair` - Server's static key pair
     pub fn new_responder(local_keypair: &KeyPair) -> Result<Self, CryptoError> {
         let builder = Builder::new(NOISE_PATTERN.parse().unwrap());
+
+        let state = builder
+            .local_private_key(local_keypair.private.as_bytes())
+            .build_responder()
+            .map_err(CryptoError::Noise)?;
+
+        Ok(Self {
+            state,
+            role: HandshakeRole::Responder,
+        })
+    }
+
+
+    /// Create a new initiator (client) handshake with specified cipher
+    pub fn new_initiator_with_cipher(
+        local_keypair: &KeyPair,
+        remote_public: &PublicKey,
+        cipher: &str,
+    ) -> Result<Self, CryptoError> {
+        let pattern = noise_pattern_for_cipher(cipher);
+        let builder = Builder::new(pattern.parse().unwrap());
+
+        let state = builder
+            .local_private_key(local_keypair.private.as_bytes())
+            .remote_public_key(remote_public.as_bytes())
+            .build_initiator()
+            .map_err(CryptoError::Noise)?;
+
+        Ok(Self {
+            state,
+            role: HandshakeRole::Initiator,
+        })
+    }
+
+    /// Create a new responder (server) handshake with specified cipher
+    pub fn new_responder_with_cipher(
+        local_keypair: &KeyPair,
+        cipher: &str,
+    ) -> Result<Self, CryptoError> {
+        let pattern = noise_pattern_for_cipher(cipher);
+        let builder = Builder::new(pattern.parse().unwrap());
 
         let state = builder
             .local_private_key(local_keypair.private.as_bytes())

@@ -157,9 +157,13 @@ pub fn build_tls_config(config: &FingerprintConfig) -> Result<ClientConfig, Fing
     // Get cipher suites for this profile
     let cipher_suites = get_cipher_suites(profile);
 
-    // Create crypto provider with specific cipher suite order
+    // Create crypto provider with Chrome-matching cipher suites and kx_groups.
+    // Explicit kx_groups ensures supported_groups extension matches Chrome's order
+    // (X25519, secp256r1, secp384r1) regardless of future rustls default changes.
+    use rustls::crypto::ring::kx_group;
     let crypto_provider = CryptoProvider {
         cipher_suites,
+        kx_groups: vec![kx_group::X25519, kx_group::SECP256R1, kx_group::SECP384R1],
         ..ring_provider::default_provider()
     };
 
