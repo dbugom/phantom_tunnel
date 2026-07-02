@@ -422,6 +422,20 @@ impl Multiplexer {
         Ok(())
     }
 
+    /// Track received data for flow control without routing through event channel.
+    /// Consumes recv_window and queues WindowUpdate if needed.
+    /// Use this when the caller forwards data directly (not through mux event channels).
+    pub fn track_recv_data(&mut self, stream_id: u32, data_len: u32) {
+        if let Some(state) = self.streams.get_mut(&stream_id) {
+            state.stream.consume_recv_window(data_len);
+            if let Some(increment) = state.stream.window_update_needed() {
+                state.stream.apply_window_update(increment);
+                self.send_queue
+                    .push(Frame::window_update(stream_id, increment));
+            }
+        }
+    }
+
     /// Get frames ready to send
     pub fn take_send_queue(&mut self) -> Vec<Frame> {
         std::mem::take(&mut self.send_queue)

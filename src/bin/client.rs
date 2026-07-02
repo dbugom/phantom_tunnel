@@ -12,7 +12,7 @@ use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
     obfuscation::BrowserProfile,
-    tunnel::{Frame, FrameType, Multiplexer},
+    tunnel::{Frame, FrameType, Multiplexer, BdpEstimator},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -87,8 +87,8 @@ struct OpenStreamRequest {
 struct StreamConnection {
     stream_id: u32,
     #[allow(dead_code)] // Kept for symmetry, sending uses TunnelCommand::SendData
-    data_tx: mpsc::Sender<bytes::Bytes>,
-    data_rx: mpsc::Receiver<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
+    data_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
     /// Cloned tunnel command sender, captured at stream-open time for relay tasks
     cmd_tx: mpsc::Sender<TunnelCommand>,
 }
@@ -337,7 +337,7 @@ fn generate_keypair() -> Result<()> {
 
 /// Active stream state in the tunnel
 struct ActiveStream {
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
     /// If Some, the stream is draining (closed by client, waiting for cleanup)
     draining_since: Option<Instant>,
 }
@@ -431,8 +431,36 @@ where
 
     info!("Handshake complete, tunnel established");
 
+    // Spawn dedicated writer task — all I/O writes go through this task
+    // so the main select! loop never blocks on H2 flow control or slow TCP writes.
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (write_err_tx, mut write_err_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        // Batch writes: recv first message, drain all pending, flush once per batch
+        while let Some(data) = write_rx.recv().await {
+            if let Err(e) = write_half.write_all(&data).await {
+                let _ = write_err_tx.send(format!("write error: {}", e));
+                return;
+            }
+            // Drain all pending writes before flushing (reduces flush syscalls)
+            while let Ok(data) = write_rx.try_recv() {
+                if let Err(e) = write_half.write_all(&data).await {
+                    let _ = write_err_tx.send(format!("write error: {}", e));
+                    return;
+                }
+            }
+            if let Err(e) = write_half.flush().await {
+                let _ = write_err_tx.send(format!("flush error: {}", e));
+                return;
+            }
+        }
+    });
+
     // Create channel for reader task to send frames to main loop
-    let (reader_tx, mut reader_rx) = mpsc::channel::<ReaderMessage>(256);
+    // Unbounded: prevents reader task from blocking when main loop is busy
+    // writing to H2 (which can block on flow control). H2 flow control
+    // limits memory naturally.
+    let (reader_tx, mut reader_rx) = mpsc::unbounded_channel::<ReaderMessage>();
 
     // Spawn dedicated reader task - this will NOT be cancelled by select!
     tokio::spawn(async move {
@@ -442,28 +470,28 @@ where
             let mut len_buf = [0u8; 2];
             if let Err(e) = read_half.read_exact(&mut len_buf).await {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    let _ = reader_tx.send(ReaderMessage::Closed).await;
+                    let _ = reader_tx.send(ReaderMessage::Closed);
                 } else {
-                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 }
                 break;
             }
 
             let frame_len = u16::from_be_bytes(len_buf) as usize;
             if frame_len > buf.len() {
-                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len))).await;
+                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len)));
                 break;
             }
 
             // Read frame data
             if let Err(e) = read_half.read_exact(&mut buf[..frame_len]).await {
-                let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 break;
             }
 
-            // Send complete frame to main loop
+            // Send complete frame to main loop (non-blocking)
             let frame_data = buf[..frame_len].to_vec();
-            if reader_tx.send(ReaderMessage::Frame(frame_data)).await.is_err() {
+            if reader_tx.send(ReaderMessage::Frame(frame_data)).is_err() {
                 break; // Main loop closed
             }
         }
@@ -494,6 +522,9 @@ where
     let mut last_pong = Instant::now();
     let mut pong_pending = false;
     let mut missed_pongs: u32 = 0;
+
+    // BDP estimator for measuring throughput
+    let mut bdp = BdpEstimator::new();
 
     loop {
         tokio::select! {
@@ -547,18 +578,40 @@ where
                             debug!("Decoded frame: type={:?} stream={} payload={} bytes",
                                    frame.frame_type, frame.stream_id, frame.payload.len());
 
+                            // Track whether mux.handle_frame() was already called
+                            // (Data frames call it early to prevent flow control deadlock)
+                            let mut mux_already_handled = false;
+
                             // Handle data frames specially - forward to stream handler
                             if frame.frame_type == FrameType::Data {
+                                // BDP measurement: track bytes received
+                                if bdp.on_data_received(frame.payload.len() as u32) {
+                                    let ping_frame = Frame::ping(0);
+                                    let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                                    write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                    trace!("BDP measurement PING sent");
+                                }
+
                                 if let Some(active) = active_streams.get(&frame.stream_id) {
                                     if active.draining_since.is_some() {
                                         // Stream is draining - silently drop data (in-flight from server)
                                         trace!("Dropping data for draining stream {}: {} bytes",
                                                frame.stream_id, frame.payload.len());
-                                    } else if active.data_tx.send(frame.payload.clone()).await.is_err() {
-                                        // Channel closed - mark as draining instead of removing
-                                        debug!("Stream {} receiver closed, marking as draining", frame.stream_id);
-                                        if let Some(stream) = active_streams.get_mut(&frame.stream_id) {
-                                            stream.draining_since = Some(Instant::now());
+                                    } else {
+                                        // Update flow control tracking before forwarding data.
+                                        // Uses unbounded channel so send() never blocks the main loop.
+                                        if let Err(e) = mux.handle_frame(frame.clone()).await {
+                                            debug!("Frame handling error: {}", e);
+                                        }
+                                        mux_already_handled = true;
+
+                                        // Forward data to the stream relay task (non-blocking)
+                                        if active.data_tx.send(frame.payload.clone()).is_err() {
+                                            // Channel closed - mark as draining instead of removing
+                                            debug!("Stream {} receiver closed, marking as draining", frame.stream_id);
+                                            if let Some(stream) = active_streams.get_mut(&frame.stream_id) {
+                                                stream.draining_since = Some(Instant::now());
+                                            }
                                         }
                                     }
                                 } else {
@@ -567,8 +620,8 @@ where
                                            frame.stream_id, frame.payload.len());
                                     if closed_streams_notified.insert(frame.stream_id) {
                                         let close_frame = Frame::stream_close(frame.stream_id);
-                                        send_frame_write_buffered(&mut write_half, &mut noise_transport, &close_frame, &mut encrypt_buf).await?;
-                                        write_half.flush().await?;
+                                        let wire = encrypt_frame_to_wire(&mut noise_transport, &close_frame, &mut encrypt_buf)?;
+                                        write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                     }
                                 }
                             } else if frame.frame_type == FrameType::StreamClose {
@@ -579,25 +632,29 @@ where
                                 pong_pending = false;
                                 missed_pongs = 0;
                                 last_pong = Instant::now();
+                                // BDP measurement: compute throughput on PONG
+                                bdp.on_pong_received();
                                 debug!("Keepalive PONG received");
                             } else if frame.frame_type == FrameType::Ping {
                                 // Respond to server pings
                                 let pong_frame = Frame::pong(0);
-                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &pong_frame, &mut encrypt_buf).await?;
-                                write_half.flush().await?;
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &pong_frame, &mut encrypt_buf)?;
+                                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                 debug!("Keepalive PONG sent in response to PING");
                             }
 
-                            // Only let multiplexer handle frame if stream is not draining
-                            // This prevents WindowUpdate frames for draining streams
-                            let is_draining = active_streams
-                                .get(&frame.stream_id)
-                                .map(|s| s.draining_since.is_some())
-                                .unwrap_or(false);
+                            // Let multiplexer handle non-Data frames (StreamClose, Ping, Pong)
+                            // Data frames were already handled above before the channel send
+                            if !mux_already_handled {
+                                let is_draining = active_streams
+                                    .get(&frame.stream_id)
+                                    .map(|s| s.draining_since.is_some())
+                                    .unwrap_or(false);
 
-                            if !is_draining {
-                                if let Err(e) = mux.handle_frame(frame).await {
-                                    debug!("Frame handling error: {}", e);
+                                if !is_draining {
+                                    if let Err(e) = mux.handle_frame(frame).await {
+                                        debug!("Frame handling error: {}", e);
+                                    }
                                 }
                             }
                         }
@@ -628,17 +685,19 @@ where
                                 // This ensures STREAM_OPEN arrives at server before any DATA frames
                                 let mut send_failed = false;
                                 for frame in mux.take_send_queue() {
-                                    if let Err(e) = send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await {
-                                        error!("Failed to send STREAM_OPEN: {}", e);
-                                        send_failed = true;
-                                        break;
-                                    }
-                                }
-                                // Flush to ensure STREAM_OPEN is sent immediately
-                                if !send_failed {
-                                    if let Err(e) = write_half.flush().await {
-                                        error!("Failed to flush STREAM_OPEN: {}", e);
-                                        send_failed = true;
+                                    match encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf) {
+                                        Ok(wire) => {
+                                            if write_tx.send(wire).is_err() {
+                                                error!("Failed to send STREAM_OPEN: writer task exited");
+                                                send_failed = true;
+                                                break;
+                                            }
+                                        }
+                                        Err(e) => {
+                                            error!("Failed to encrypt STREAM_OPEN: {}", e);
+                                            send_failed = true;
+                                            break;
+                                        }
                                     }
                                 }
 
@@ -647,8 +706,9 @@ where
                                     continue;
                                 }
 
-                                // Create channels for this stream's data
-                                let (data_tx, data_rx) = mpsc::channel(256);
+                                // Unbounded channel: never blocks the main loop when
+                                // the downstream consumer (browser) is slow
+                                let (data_tx, data_rx) = mpsc::unbounded_channel();
 
                                 // Store the sender for incoming data
                                 active_streams.insert(stream_id, ActiveStream {
@@ -688,10 +748,10 @@ where
                                 let end = std::cmp::min(offset + max_payload, data.len());
                                 let chunk = data.slice(offset..end);
                                 let frame = Frame::data(stream_id, chunk);
-                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf)?;
+                                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                 offset = end;
                             }
-                            write_half.flush().await?;
                         } else {
                             trace!("Dropping send for draining/unknown stream {}", stream_id);
                         }
@@ -723,10 +783,16 @@ where
                 }
                 // Send Ping
                 let ping_frame = Frame::ping(0);
-                send_frame_write_buffered(&mut write_half, &mut noise_transport, &ping_frame, &mut encrypt_buf).await?;
-                write_half.flush().await?;
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                 pong_pending = true;
                 debug!("Keepalive PING sent");
+            }
+
+            // Writer task error
+            Some(err) = write_err_rx.recv() => {
+                error!("Writer error: {}", err);
+                return Err(anyhow!("Writer error: {}", err));
             }
 
             // Shutdown signal
@@ -737,9 +803,7 @@ where
         }
 
         // Send queued frames from multiplexer (e.g., WindowUpdate)
-        let queued_frames = mux.take_send_queue();
-        let has_queued = !queued_frames.is_empty();
-        for frame in queued_frames {
+        for frame in mux.take_send_queue() {
             // Don't send frames for draining streams
             let is_draining = active_streams
                 .get(&frame.stream_id)
@@ -747,12 +811,9 @@ where
                 .unwrap_or(false);
 
             if !is_draining || frame.frame_type == FrameType::StreamClose {
-                send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf)?;
+                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
             }
-        }
-        // Flush all buffered writes as a single batch
-        if has_queued {
-            write_half.flush().await?;
         }
     }
 
@@ -894,6 +955,7 @@ async fn send_frame_write<W: AsyncWrite + Unpin>(
 }
 
 /// Send an encrypted frame using write half with reusable buffer (reduces allocations)
+#[allow(dead_code)]
 async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
     write_half: &mut W,
     noise: &mut NoiseTransport,
@@ -923,6 +985,43 @@ async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
     write_half.write_all(&wire_buf).await?;
 
     Ok(())
+}
+
+/// Encrypt a frame and return the wire bytes (2-byte length prefix + ciphertext).
+/// CPU-only, no I/O — safe to call from the main select! loop without blocking.
+fn encrypt_frame_to_wire(
+    noise: &mut NoiseTransport,
+    frame: &Frame,
+    encrypt_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>> {
+    let plaintext = frame.encode();
+
+    // Ensure buffer is large enough
+    let needed = plaintext.len() + 16;
+    if encrypt_buf.len() < needed {
+        encrypt_buf.resize(needed, 0);
+    }
+
+    let ct_len = noise
+        .encrypt(&plaintext, encrypt_buf)
+        .context("Failed to encrypt frame")?;
+
+    trace!("Encrypting frame type {:?} stream {} ({} bytes)",
+           frame.frame_type, frame.stream_id, ct_len);
+
+    // Build wire format: 2-byte BE length prefix + ciphertext
+    // Safety: ct_len MUST fit in u16. If it doesn't, the length prefix would
+    // silently overflow, corrupting the wire stream (the receiver would read
+    // a wrong frame size and all subsequent frames would be garbage).
+    assert!(ct_len <= u16::MAX as usize,
+        "encrypted frame too large for u16 wire prefix: {} bytes (max {})",
+        ct_len, u16::MAX);
+    let len_bytes = (ct_len as u16).to_be_bytes();
+    let mut wire_buf = Vec::with_capacity(2 + ct_len);
+    wire_buf.extend_from_slice(&len_bytes);
+    wire_buf.extend_from_slice(&encrypt_buf[..ct_len]);
+
+    Ok(wire_buf)
 }
 
 /// Run local SOCKS5 proxy

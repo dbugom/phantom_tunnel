@@ -11,7 +11,7 @@ use clap::Parser;
 use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
-    tunnel::{Frame, FrameType, Multiplexer},
+    tunnel::{Frame, FrameType, Multiplexer, BdpEstimator},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -55,6 +55,8 @@ struct ServerState {
     allowed_clients: HashSet<String>,
     /// Connection semaphore for limiting concurrent connections
     conn_semaphore: Semaphore,
+    /// Decoy backend address for active probing resistance
+    decoy_backend: Option<String>,
 }
 
 /// Command to send data back through the tunnel
@@ -67,7 +69,7 @@ enum StreamToTunnel {
 
 /// Active stream with channel to send data to it
 struct ActiveStream {
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    data_tx: mpsc::UnboundedSender<bytes::Bytes>,
     /// If Some, the stream is draining (closed by client, waiting for cleanup)
     draining_since: Option<Instant>,
 }
@@ -147,6 +149,7 @@ async fn main() -> Result<()> {
         keypair,
         allowed_clients,
         conn_semaphore: Semaphore::new(server_config.max_connections),
+        decoy_backend: server_config.decoy_backend.clone(),
     });
 
     // Build TLS acceptor if cert/key are configured
@@ -296,6 +299,7 @@ async fn handle_connection(
 ) -> Result<()> {
     // Acquire connection permit (clone Arc first so we can move state into inner fn)
     let inner_state = Arc::clone(&state);
+    let decoy_backend = state.decoy_backend.clone();
     let _permit = state
         .conn_semaphore
         .acquire()
@@ -319,25 +323,29 @@ async fn handle_connection(
             match phantom_tunnel::transport::h2_camouflage::server_h2_accept(tls_stream).await {
                 Ok(Some((h2_reader, h2_writer))) => {
                     debug!("H2 CONNECT accepted, proceeding with Noise handshake");
-                    return handle_connection_inner(h2_reader, h2_writer, inner_state).await;
+                    return handle_connection_inner(h2_reader, h2_writer, inner_state, decoy_backend.clone()).await;
                 }
                 Ok(None) => {
-                    debug!("No valid CONNECT request (possible probe)");
+                    warn!("No CONNECT request received (possible probe)");
                     return Ok(());
                 }
                 Err(e) => {
-                    debug!("H2 handshake failed (possible probe): {}", e);
+                    warn!("H2 handshake failed (possible probe): {}", e);
+                    // Hold connection open — timing resistance.
+                    // The TLS stream is consumed by h2 so we can't proxy to decoy,
+                    // but sleeping avoids instant-drop fingerprinting.
+                    tokio::time::sleep(Duration::from_secs(30)).await;
                     return Ok(());
                 }
             }
         }
 
         let (read_half, write_half) = tokio::io::split(tls_stream);
-        handle_connection_inner(read_half, write_half, inner_state).await
+        handle_connection_inner(read_half, write_half, inner_state, decoy_backend).await
     } else {
         // Raw TCP (backward compat)
         let (read_half, write_half) = stream.into_split();
-        handle_connection_inner(read_half, write_half, inner_state).await
+        handle_connection_inner(read_half, write_half, inner_state, decoy_backend).await
     }
 }
 
@@ -346,6 +354,7 @@ async fn handle_connection_inner<R, W>(
     mut read_half: R,
     write_half: W,
     state: Arc<ServerState>,
+    _decoy_backend: Option<String>,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -362,13 +371,44 @@ where
     let client_key_b64 = client_public.to_base64();
     if !state.allowed_clients.is_empty() && !state.allowed_clients.contains(&client_key_b64) {
         warn!("Rejected unknown client: {}...", &client_key_b64[..16]);
-        return Err(anyhow!("Client not in allowed list"));
+        // Hold connection open for timing resistance instead of dropping immediately.
+        // An instant close on auth failure is distinguishable from a normal web server.
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        return Ok(());
     }
 
     info!("Client connected: {}...", &client_key_b64[..16]);
 
+    // Spawn dedicated writer task — all I/O writes go through this task
+    // so the main select! loop never blocks on H2 flow control or slow TCP writes.
+    let (write_tx, mut write_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let (write_err_tx, mut write_err_rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        // Batch writes: recv first message, drain all pending, flush once per batch
+        while let Some(data) = write_rx.recv().await {
+            if let Err(e) = write_half.write_all(&data).await {
+                let _ = write_err_tx.send(format!("write error: {}", e));
+                return;
+            }
+            // Drain all pending writes before flushing (reduces flush syscalls)
+            while let Ok(data) = write_rx.try_recv() {
+                if let Err(e) = write_half.write_all(&data).await {
+                    let _ = write_err_tx.send(format!("write error: {}", e));
+                    return;
+                }
+            }
+            if let Err(e) = write_half.flush().await {
+                let _ = write_err_tx.send(format!("flush error: {}", e));
+                return;
+            }
+        }
+    });
+
     // Create channel for reader task to send frames to main loop
-    let (reader_tx, mut reader_rx) = mpsc::channel::<ReaderMessage>(256);
+    // Unbounded: prevents reader task from blocking when main loop is busy
+    // writing to H2 (which can block on flow control). H2 flow control
+    // limits memory naturally.
+    let (reader_tx, mut reader_rx) = mpsc::unbounded_channel::<ReaderMessage>();
 
     // Spawn dedicated reader task - this will NOT be cancelled by select!
     tokio::spawn(async move {
@@ -378,28 +418,28 @@ where
             let mut len_buf = [0u8; 2];
             if let Err(e) = read_half.read_exact(&mut len_buf).await {
                 if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    let _ = reader_tx.send(ReaderMessage::Closed).await;
+                    let _ = reader_tx.send(ReaderMessage::Closed);
                 } else {
-                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                    let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 }
                 break;
             }
 
             let frame_len = u16::from_be_bytes(len_buf) as usize;
             if frame_len > buf.len() {
-                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len))).await;
+                let _ = reader_tx.send(ReaderMessage::Error(format!("Frame too large: {}", frame_len)));
                 break;
             }
 
             // Read frame data
             if let Err(e) = read_half.read_exact(&mut buf[..frame_len]).await {
-                let _ = reader_tx.send(ReaderMessage::Error(e.to_string())).await;
+                let _ = reader_tx.send(ReaderMessage::Error(e.to_string()));
                 break;
             }
 
-            // Send complete frame to main loop
+            // Send complete frame to main loop (non-blocking)
             let frame_data = buf[..frame_len].to_vec();
-            if reader_tx.send(ReaderMessage::Frame(frame_data)).await.is_err() {
+            if reader_tx.send(ReaderMessage::Frame(frame_data)).is_err() {
                 break; // Main loop closed
             }
         }
@@ -412,7 +452,10 @@ where
     let mut active_streams: HashMap<u32, ActiveStream> = HashMap::new();
 
     // Channel for stream tasks to send data back through tunnel
-    let (tunnel_tx, mut tunnel_rx) = mpsc::channel::<StreamToTunnel>(256);
+    // Unbounded: prevents relay tasks from blocking when the main loop is
+    // busy writing to H2 (flow-control stall). H2 + TCP flow control
+    // bound memory naturally.
+    let (tunnel_tx, mut tunnel_rx) = mpsc::unbounded_channel::<StreamToTunnel>();
 
     // Buffer for decryption (reused to avoid allocations)
     let mut frame_buf = vec![0u8; 65536];
@@ -430,6 +473,9 @@ where
     let mut last_pong = Instant::now();
     let mut pong_pending = false;
     let mut missed_pongs: u32 = 0;
+
+    // BDP estimator for measuring throughput
+    let mut bdp = BdpEstimator::new();
 
     loop {
         tokio::select! {
@@ -491,8 +537,9 @@ where
 
                                         info!("Opening stream {} to {}", stream_id, destination);
 
-                                        // Create channel for sending data to this stream
-                                        let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(256);
+                                        // Unbounded channel: never blocks the main loop when
+                                        // the destination is slow to consume data
+                                        let (data_tx, data_rx) = mpsc::unbounded_channel::<bytes::Bytes>();
                                         active_streams.insert(stream_id, ActiveStream {
                                             data_tx,
                                             draining_since: None,
@@ -515,16 +562,29 @@ where
                             FrameType::Data => {
                                 // Forward data to appropriate stream handler
                                 let stream_id = frame.stream_id;
+                                let payload_len = frame.payload.len() as u32;
+
+                                // BDP measurement: track bytes received
+                                if bdp.on_data_received(payload_len) {
+                                    let ping_frame = Frame::ping(0);
+                                    let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                                    write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
+                                    trace!("BDP measurement PING sent");
+                                }
+
                                 if let Some(active) = active_streams.get(&stream_id) {
                                     if active.draining_since.is_some() {
                                         // Stream is draining - silently drop
                                         trace!("Dropping data for draining stream {}", stream_id);
-                                    } else if active.data_tx.send(frame.payload).await.is_err() {
+                                    } else if active.data_tx.send(frame.payload).is_err() {
                                         // Stream handler closed - mark as draining instead of removing
                                         debug!("Stream {} handler closed, marking as draining", stream_id);
                                         if let Some(stream) = active_streams.get_mut(&stream_id) {
                                             stream.draining_since = Some(Instant::now());
                                         }
+                                    } else {
+                                        // Track flow control: consume recv_window, queue WindowUpdate
+                                        mux.track_recv_data(stream_id, payload_len);
                                     }
                                 } else {
                                     // Unknown stream - likely already cleaned up
@@ -546,13 +606,15 @@ where
                                 pong_pending = false;
                                 missed_pongs = 0;
                                 last_pong = Instant::now();
+                                // BDP measurement: compute throughput on PONG
+                                bdp.on_pong_received();
                                 debug!("Keepalive PONG received from client");
                             }
                             FrameType::Ping => {
                                 // Respond to client pings
                                 let pong_frame = Frame::pong(0);
-                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &pong_frame, &mut encrypt_buf).await?;
-                                write_half.flush().await?;
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &pong_frame, &mut encrypt_buf)?;
+                                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                 debug!("Keepalive PONG sent in response to PING");
                             }
                             _ => {
@@ -590,10 +652,10 @@ where
                                 let end = std::cmp::min(offset + max_payload, data.len());
                                 let chunk = data.slice(offset..end);
                                 let frame = Frame::data(stream_id, chunk);
-                                send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf)?;
+                                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                                 offset = end;
                             }
-                            write_half.flush().await?;
                         } else {
                             trace!("Dropping outbound data for draining stream {}", stream_id);
                         }
@@ -623,10 +685,16 @@ where
                 }
                 // Send Ping
                 let ping_frame = Frame::ping(0);
-                send_frame_write_buffered(&mut write_half, &mut noise_transport, &ping_frame, &mut encrypt_buf).await?;
-                write_half.flush().await?;
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &ping_frame, &mut encrypt_buf)?;
+                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
                 pong_pending = true;
                 debug!("Keepalive PING sent");
+            }
+
+            // Writer task error
+            Some(err) = write_err_rx.recv() => {
+                error!("Writer error: {}", err);
+                return Err(anyhow!("Writer error: {}", err));
             }
 
             // Shutdown
@@ -636,9 +704,7 @@ where
         }
 
         // Send any queued frames from multiplexer
-        let queued_frames = mux.take_send_queue();
-        let has_queued = !queued_frames.is_empty();
-        for frame in queued_frames {
+        for frame in mux.take_send_queue() {
             // Don't send frames for draining streams
             let is_draining = active_streams
                 .get(&frame.stream_id)
@@ -646,12 +712,9 @@ where
                 .unwrap_or(false);
 
             if !is_draining || frame.frame_type == FrameType::StreamClose {
-                send_frame_write_buffered(&mut write_half, &mut noise_transport, &frame, &mut encrypt_buf).await?;
+                let wire = encrypt_frame_to_wire(&mut noise_transport, &frame, &mut encrypt_buf)?;
+                write_tx.send(wire).map_err(|_| anyhow!("Writer task exited"))?;
             }
-        }
-        // Flush all buffered writes as a single batch
-        if has_queued {
-            write_half.flush().await?;
         }
     }
 
@@ -778,6 +841,7 @@ async fn send_frame_write<W: AsyncWrite + Unpin>(
 }
 
 /// Send an encrypted frame with reusable buffer (reduces allocations)
+#[allow(dead_code)]
 async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
     write_half: &mut W,
     noise: &mut NoiseTransport,
@@ -809,6 +873,43 @@ async fn send_frame_write_buffered<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Encrypt a frame and return the wire bytes (2-byte length prefix + ciphertext).
+/// CPU-only, no I/O — safe to call from the main select! loop without blocking.
+fn encrypt_frame_to_wire(
+    noise: &mut NoiseTransport,
+    frame: &Frame,
+    encrypt_buf: &mut Vec<u8>,
+) -> Result<Vec<u8>> {
+    let plaintext = frame.encode();
+
+    // Ensure buffer is large enough
+    let needed = plaintext.len() + 16;
+    if encrypt_buf.len() < needed {
+        encrypt_buf.resize(needed, 0);
+    }
+
+    let ct_len = noise
+        .encrypt(&plaintext, encrypt_buf)
+        .context("Failed to encrypt frame")?;
+
+    trace!("Encrypting frame type {:?} stream {} ({} bytes)",
+           frame.frame_type, frame.stream_id, ct_len);
+
+    // Build wire format: 2-byte BE length prefix + ciphertext
+    // Safety: ct_len MUST fit in u16. If it doesn't, the length prefix would
+    // silently overflow, corrupting the wire stream (the receiver would read
+    // a wrong frame size and all subsequent frames would be garbage).
+    assert!(ct_len <= u16::MAX as usize,
+        "encrypted frame too large for u16 wire prefix: {} bytes (max {})",
+        ct_len, u16::MAX);
+    let len_bytes = (ct_len as u16).to_be_bytes();
+    let mut wire_buf = Vec::with_capacity(2 + ct_len);
+    wire_buf.extend_from_slice(&len_bytes);
+    wire_buf.extend_from_slice(&encrypt_buf[..ct_len]);
+
+    Ok(wire_buf)
+}
+
 /// Send an encrypted frame (legacy, for non-split streams)
 #[allow(dead_code)]
 async fn send_frame(
@@ -837,8 +938,8 @@ async fn send_frame(
 async fn handle_stream(
     stream_id: u32,
     destination: String,
-    mut data_rx: mpsc::Receiver<bytes::Bytes>,
-    tunnel_tx: mpsc::Sender<StreamToTunnel>,
+    mut data_rx: mpsc::UnboundedReceiver<bytes::Bytes>,
+    tunnel_tx: mpsc::UnboundedSender<StreamToTunnel>,
 ) -> Result<()> {
     // Connect to destination
     let target = match TcpStream::connect(&destination).await {
@@ -851,7 +952,7 @@ async fn handle_stream(
         Err(e) => {
             error!("Stream {} failed to connect to {}: {}", stream_id, destination, e);
             // Send close to client
-            let _ = tunnel_tx.send(StreamToTunnel::Close { stream_id }).await;
+            let _ = tunnel_tx.send(StreamToTunnel::Close { stream_id });
             return Err(e.into());
         }
     };
@@ -859,7 +960,7 @@ async fn handle_stream(
     let (mut target_read, mut target_write) = target.into_split();
     let tunnel_tx_clone = tunnel_tx.clone();
 
-    // Task to read from target and send to tunnel
+    // Task to read from target and send to tunnel (non-blocking sends)
     let mut target_to_tunnel = tokio::spawn(async move {
         let mut buf = vec![0u8; phantom_tunnel::tunnel::RELAY_BUFFER_SIZE];
         loop {
@@ -870,7 +971,7 @@ async fn handle_stream(
                 }
                 Ok(n) => {
                     let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                    if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).await.is_err() {
+                    if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).is_err() {
                         break;
                     }
                 }
@@ -881,7 +982,7 @@ async fn handle_stream(
             }
         }
         // Send close when target disconnects
-        let _ = tunnel_tx_clone.send(StreamToTunnel::Close { stream_id }).await;
+        let _ = tunnel_tx_clone.send(StreamToTunnel::Close { stream_id });
     });
 
     // Task to read from tunnel and send to target

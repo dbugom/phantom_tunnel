@@ -16,7 +16,9 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
+
+use super::probe_resistance;
 
 /// Target authority for the CONNECT request.
 /// This should look like a legitimate destination to DPI.
@@ -26,15 +28,15 @@ const CONNECT_AUTHORITY: &str = "api.google.com:443";
 // AsyncRead adapter (channel-based, for H2 RecvStream)
 // ============================================================
 
-/// AsyncRead adapter backed by an mpsc channel receiving Bytes from H2 RecvStream.
-/// The channel is needed because h2::RecvStream::data() is async-only (no poll variant).
+/// AsyncRead adapter backed by an unbounded mpsc channel receiving Bytes from H2 RecvStream.
+/// Unbounded so the H2 recv task never blocks — H2 flow control limits data on the wire.
 pub struct ChannelReader {
-    rx: mpsc::Receiver<Bytes>,
+    rx: mpsc::UnboundedReceiver<Bytes>,
     buf: BytesMut,
 }
 
 impl ChannelReader {
-    pub fn new(rx: mpsc::Receiver<Bytes>) -> Self {
+    pub fn new(rx: mpsc::UnboundedReceiver<Bytes>) -> Self {
         Self {
             rx,
             buf: BytesMut::new(),
@@ -157,9 +159,12 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     // Perform HTTP/2 handshake with Chrome-like SETTINGS
+    // Window sizes set to 16MB to prevent flow control stalls in long-lived tunnels.
+    // The h2 crate only sends WINDOW_UPDATE after release_capacity() is called AND
+    // the connection future is polled — small windows exhaust before updates arrive.
     let (send_request, connection) = h2::client::Builder::new()
-        .initial_window_size(6_291_456) // Chrome: 6MB
-        .initial_connection_window_size(15_728_640) // Chrome: 15MB
+        .initial_window_size(16 * 1024 * 1024) // 16MB stream window
+        .initial_connection_window_size(16 * 1024 * 1024) // 16MB connection window
         .max_frame_size(16_384) // Chrome default
         .max_header_list_size(262_144) // 256KB
         .header_table_size(65_536) // 64KB
@@ -218,8 +223,8 @@ where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut connection = h2::server::Builder::new()
-        .initial_window_size(6_291_456)
-        .initial_connection_window_size(15_728_640)
+        .initial_window_size(16 * 1024 * 1024) // 16MB stream window
+        .initial_connection_window_size(16 * 1024 * 1024) // 16MB connection window
         .max_frame_size(16_384)
         .max_header_list_size(262_144)
         .handshake::<T, Bytes>(tls_stream)
@@ -236,12 +241,9 @@ where
         let (request, mut respond) = result;
 
         if request.method() != Method::CONNECT {
-            // Not a CONNECT — respond with 404 (looks like a normal web server)
-            let response = http::Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(())
-                .unwrap();
-            respond.send_response(response, true)?;
+            // Not a CONNECT — serve realistic decoy page (looks like nginx)
+            warn!("Non-CONNECT request (possible probe): {} {}", request.method(), request.uri());
+            serve_decoy_response(request.method(), request.uri().path(), respond)?;
             continue;
         }
 
@@ -264,13 +266,9 @@ where
     tokio::spawn(async move {
         while let Some(result) = connection.accept().await {
             match result {
-                Ok((_req, mut respond)) => {
-                    // Reject any additional streams with 404
-                    let response = http::Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(())
-                        .unwrap();
-                    let _ = respond.send_response(response, true);
+                Ok((req, respond)) => {
+                    // Serve decoy page for any additional requests
+                    let _ = serve_decoy_response(req.method(), req.uri().path(), respond);
                 }
                 Err(e) => {
                     debug!("H2 server connection driver error: {e}");
@@ -282,6 +280,57 @@ where
 
     let (reader, writer) = h2_to_async_io(send_stream, recv_stream)?;
     Ok(Some((reader, writer)))
+}
+
+// ============================================================
+// Decoy response for non-CONNECT requests
+// ============================================================
+
+/// Serve a realistic nginx-like response for non-CONNECT requests.
+/// Makes the server indistinguishable from a normal web server to probers.
+fn serve_decoy_response(
+    method: &Method,
+    path: &str,
+    mut respond: h2::server::SendResponse<Bytes>,
+) -> anyhow::Result<()> {
+    let server_header = "nginx/1.24.0";
+
+    match *method {
+        Method::GET | Method::HEAD => {
+            let (status, body_html) = if path == "/" {
+                (StatusCode::OK, probe_resistance::decoy_index_html())
+            } else {
+                (StatusCode::NOT_FOUND, probe_resistance::decoy_404_html())
+            };
+
+            let response = http::Response::builder()
+                .status(status)
+                .header("server", server_header)
+                .header("content-type", "text/html")
+                .header("content-length", body_html.len().to_string())
+                .body(())
+                .unwrap();
+
+            let is_head = *method == Method::HEAD;
+            let mut send_stream = respond.send_response(response, is_head)?;
+            if !is_head {
+                send_stream.send_data(Bytes::from(body_html), true)?;
+            }
+        }
+        _ => {
+            // POST, PUT, DELETE, etc → 405 Method Not Allowed
+            let response = http::Response::builder()
+                .status(StatusCode::METHOD_NOT_ALLOWED)
+                .header("server", server_header)
+                .header("allow", "GET, HEAD")
+                .header("content-length", "0")
+                .body(())
+                .unwrap();
+            respond.send_response(response, true)?;
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================
@@ -299,15 +348,32 @@ fn h2_to_async_io(
     h2_send: h2::SendStream<Bytes>,
     mut h2_recv: RecvStream,
 ) -> anyhow::Result<(ChannelReader, H2Writer)> {
-    // Read side: H2 recv -> channel -> AsyncRead
-    let (read_tx, read_rx) = mpsc::channel::<Bytes>(256);
+    // Read side: H2 recv -> unbounded channel -> AsyncRead
+    // Unbounded so this task never blocks on send — H2 flow control on the wire
+    // limits how much data can be in-flight, bounding memory naturally.
+    let (read_tx, read_rx) = mpsc::unbounded_channel::<Bytes>();
+    // Clone the FlowControl handle BEFORE entering the recv loop.
+    // In h2 v0.4, flow_control() returns by value — calling it inside the loop
+    // after data() has been called can return a stale snapshot. Cloning once
+    // ensures release_capacity() always targets the live flow control state,
+    // so WINDOW_UPDATE frames are actually queued and sent by the connection driver.
+    let mut flow_ctl = h2_recv.flow_control().clone();
     tokio::spawn(async move {
         loop {
             match h2_recv.data().await {
                 Some(Ok(data)) => {
-                    // Release flow control capacity immediately
-                    let _ = h2_recv.flow_control().release_capacity(data.len());
-                    if read_tx.send(data).await.is_err() {
+                    let len = data.len();
+                    // Forward data to channel first, then release capacity.
+                    // Even if the channel send fails, we still release capacity
+                    // to avoid leaking flow control budget.
+                    let send_ok = read_tx.send(data).is_ok();
+                    // Release flow control capacity so the h2 connection driver
+                    // sends WINDOW_UPDATE to the peer, replenishing their send budget.
+                    if let Err(e) = flow_ctl.release_capacity(len) {
+                        debug!("H2 release_capacity failed ({len}B): {e}");
+                        break;
+                    }
+                    if !send_ok {
                         break;
                     }
                 }

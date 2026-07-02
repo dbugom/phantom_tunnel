@@ -14,6 +14,45 @@ use tokio::io::{copy_bidirectional, AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tracing::{debug, warn};
 
+/// Returns a realistic nginx default index page.
+pub fn decoy_index_html() -> &'static str {
+    r#"<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+html { color-scheme: light dark; }
+body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; }
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and
+working. Further configuration is required.</p>
+
+<p>For online documentation and support please refer to
+<a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at
+<a href="http://nginx.com/">nginx.com</a>.</p>
+
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+"#
+}
+
+/// Returns a realistic nginx 404 error page.
+pub fn decoy_404_html() -> &'static str {
+    r#"<html>
+<head><title>404 Not Found</title></head>
+<body>
+<center><h1>404 Not Found</h1></center>
+<hr><center>nginx/1.24.0</center>
+</body>
+</html>
+"#
+}
+
 /// Default decoy backend address (local Caddy/nginx serving a real website)
 const DEFAULT_DECOY_BACKEND: &str = "127.0.0.1:8443";
 
