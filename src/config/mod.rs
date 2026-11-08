@@ -98,6 +98,11 @@ pub struct ClientConfig {
     pub socks5_listen: Option<String>,
     /// Local HTTP proxy address
     pub http_listen: Option<String>,
+    /// Servers to fall back to, in order, when `server` cannot be reached or
+    /// refuses this client. Each entry is either `"host:port"` (same server key
+    /// as `server_public_key`) or `{ address = "host:port", public_key = "..." }`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub backup_servers: Vec<BackupServer>,
 }
 
 impl Default for ClientConfig {
@@ -109,6 +114,50 @@ impl Default for ClientConfig {
             public_key: String::new(),
             socks5_listen: Some("127.0.0.1:1080".to_string()),
             http_listen: Some("127.0.0.1:8080".to_string()),
+            backup_servers: Vec::new(),
+        }
+    }
+}
+
+/// A fallback server for the client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "BackupServerRepr")]
+pub struct BackupServer {
+    /// `host:port`
+    pub address: String,
+    /// Server public key (base64). Empty means the same key as the primary
+    /// server, i.e. the same server reachable at another address, or a second
+    /// box sharing the primary's key.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub public_key: String,
+}
+
+/// Accepted spellings of a [`BackupServer`] in TOML.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum BackupServerRepr {
+    Address(String),
+    Full {
+        address: String,
+        #[serde(default)]
+        public_key: String,
+    },
+}
+
+impl From<BackupServerRepr> for BackupServer {
+    fn from(r: BackupServerRepr) -> Self {
+        match r {
+            BackupServerRepr::Address(address) => Self {
+                address,
+                public_key: String::new(),
+            },
+            BackupServerRepr::Full {
+                address,
+                public_key,
+            } => Self {
+                address,
+                public_key,
+            },
         }
     }
 }
@@ -239,6 +288,77 @@ socks5_listen = "127.0.0.1:1080"
             let cfg: Config = toml::from_str(text).unwrap_or_else(|e| panic!("{}: {}", name, e));
             assert!(cfg.server.is_some() || cfg.client.is_some(), "{} is empty", name);
         }
+    }
+
+    /// Backup servers: bare strings, inline tables and `[[client.backup_servers]]`
+    /// array-of-tables all load; a config without the key has no backups.
+    #[test]
+    fn backup_servers_parse_in_every_spelling() {
+        let text = format!(
+            r#"[client]
+server = "examroom.dbug.om:8444"
+server_public_key = "{k}"
+socks5_listen = "127.0.0.1:1080"
+backup_servers = [
+    "46.225.110.152:8444",                                  # same box, by IP
+    {{ address = "backup.example.net:443", public_key = "{k}" }},
+]
+"#,
+            k = KEY
+        );
+        let c = toml::from_str::<Config>(&text).unwrap().client.unwrap();
+        assert_eq!(
+            c.backup_servers,
+            vec![
+                BackupServer { address: "46.225.110.152:8444".into(), public_key: String::new() },
+                BackupServer { address: "backup.example.net:443".into(), public_key: KEY.into() },
+            ]
+        );
+
+        let text = format!(
+            r#"[client]
+server = "a:1"
+server_public_key = "{k}"
+socks5_listen = "127.0.0.1:1080"
+
+[[client.backup_servers]]
+address = "b:2"
+
+[[client.backup_servers]]
+address = "c:3"
+public_key = "{k}"
+"#,
+            k = KEY
+        );
+        let c = toml::from_str::<Config>(&text).unwrap().client.unwrap();
+        assert_eq!(c.backup_servers.len(), 2);
+        assert_eq!(c.backup_servers[0].address, "b:2");
+        assert!(c.backup_servers[0].public_key.is_empty());
+        assert_eq!(c.backup_servers[1].public_key, KEY);
+    }
+
+    /// A config with backups survives save + load (the client rewrites its
+    /// config when it generates a key, and `--import` writes one).
+    #[test]
+    fn backup_servers_survive_save_and_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let cfg = Config {
+            client: Some(ClientConfig {
+                server: "a:1".into(),
+                server_public_key: KEY.into(),
+                backup_servers: vec![
+                    BackupServer { address: "b:2".into(), public_key: String::new() },
+                    BackupServer { address: "[2001:db8::1]:3".into(), public_key: KEY.into() },
+                ],
+                ..ClientConfig::default()
+            }),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let back = Config::load(&path).unwrap().client.unwrap();
+        assert_eq!(back.backup_servers, cfg.client.unwrap().backup_servers);
+        assert_eq!(back.socks5_listen.as_deref(), Some("127.0.0.1:1080"));
     }
 
     /// Saving and re-loading keeps every setting.

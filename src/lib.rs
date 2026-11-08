@@ -11,7 +11,9 @@
 //!   per-stream credit-based flow control ([`tunnel::StreamFlow`]), and the
 //!   address header used by UDP datagrams.
 //! - [`config`]: the TOML configuration shared by `phantom-server` and
-//!   `phantom-client`.
+//!   `phantom-client`, including the client's `backup_servers`.
+//! - [`link`]: `phantom://` connect links (`phantom-server link`,
+//!   `phantom-client --import`).
 //!
 //! The event loops themselves live in `src/bin/server.rs` and
 //! `src/bin/client.rs`.
@@ -27,6 +29,7 @@
 
 pub mod config;
 pub mod crypto;
+pub mod link;
 pub mod tunnel;
 
 pub use config::Config;

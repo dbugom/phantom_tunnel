@@ -34,6 +34,14 @@ impl KeyPair {
             ),
         })
     }
+
+    /// Build a key pair from a private key alone, deriving the public half.
+    pub fn from_private(private: PrivateKey) -> Self {
+        Self {
+            public: private.public_key(),
+            private,
+        }
+    }
 }
 
 /// X25519 public key
@@ -104,6 +112,23 @@ impl PrivateKey {
         &self.0
     }
 
+    /// Derive the X25519 public key for this private key.
+    ///
+    /// This is the key the peer actually sees in the Noise handshake, so it is
+    /// the authoritative value; a `public_key` stored next to the private key
+    /// in a config file is only a convenience copy.
+    pub fn public_key(&self) -> PublicKey {
+        use snow::params::DHChoice;
+        use snow::resolvers::{CryptoResolver, DefaultResolver};
+        let mut dh = DefaultResolver
+            .resolve_dh(&DHChoice::Curve25519)
+            .expect("snow default resolver supports Curve25519");
+        dh.set(&self.0);
+        let mut out = [0u8; KEY_LEN];
+        out.copy_from_slice(dh.pubkey());
+        PublicKey(out)
+    }
+
     /// Encode as base64 (be careful with this!)
     pub fn to_base64(&self) -> String {
         use base64::Engine;
@@ -156,5 +181,15 @@ mod tests {
         let b64 = kp.public.to_base64();
         let recovered = PublicKey::from_base64(&b64).unwrap();
         assert_eq!(kp.public, recovered);
+    }
+
+    #[test]
+    fn derived_public_key_matches_generated_pair() {
+        for _ in 0..8 {
+            let kp = KeyPair::generate().unwrap();
+            assert_eq!(kp.private.public_key(), kp.public);
+            let rebuilt = KeyPair::from_private(kp.private.clone());
+            assert_eq!(rebuilt.public, kp.public);
+        }
     }
 }

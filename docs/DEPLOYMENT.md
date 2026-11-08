@@ -172,6 +172,45 @@ journalctl -u phantom-tunnel -f
 
 ## Client Setup
 
+### Quickest: a connect link
+
+On the server, make a link for the new device. `--address` is what clients
+dial (the port from `listen` is used if you leave it out); add `--backup` for
+each fallback server, in order (`host:port`, or `KEY@host:port` if that server
+has a different key).
+
+```bash
+phantom-server -c /etc/phantom_tunnel/config.toml link \
+    --address vpn.example.com --backup 203.0.113.10:8444 \
+    --label "device5" --new-client-key
+```
+
+stdout is the link alone (`LINK=$(phantom-server ... link ...)` works); stderr
+tells you the line to add to `allowed_clients`, e.g.
+`"Xy...=",  # device5`. Add it and restart the server.
+
+With `--new-client-key` the link **is a credential** — anyone holding it can
+connect as that device until you remove the key from `allowed_clients`. Send it
+privately. Without `--new-client-key` the link is not secret; the device makes
+its own key when importing and shows the public key for you to add.
+
+On the device:
+
+```bash
+phantom-client -c config.toml --import -     # paste the link, press Enter
+phantom-client -c config.toml
+```
+
+If the device's key has not been authorised yet, the client logs
+`... closed the connection right after the handshake ... not in its
+allowed_clients: <key>` — that is the key to add.
+
+To change a device's servers later (say, a new backup), make a key-less link
+and import it with `--force`: the device keeps its key and proxy ports, and
+the previous file is kept as `config.toml.bak`.
+
+### Manual setup
+
 ### 1. Generate Client Keypair
 
 ```bash
@@ -254,6 +293,33 @@ export ALL_PROXY=socks5://127.0.0.1:1080
 | `private_key` | Client's private key (base64) | Required |
 | `socks5_listen` | Local SOCKS5 proxy address | `127.0.0.1:1080` |
 | `http_listen` | Local HTTP proxy address | `127.0.0.1:8080` |
+| `backup_servers` | Fallback servers, tried in order: `"host:port"` (same server key) or `{ address = "host:port", public_key = "..." }` | `[]` |
+
+`public_key` is optional: the client and server derive it from `private_key`
+and warn if a stored copy doesn't match.
+
+#### Failover
+
+The client stays on whichever server last worked. A server counts as failed
+when the TCP connection isn't accepted within 10 s, the handshake isn't
+answered within 10 s, or the server closes the connection right after the
+handshake (this client's key is not in its `allowed_clients`). On failure the
+client moves straight to the next server in the list; once every server has
+failed in a row it waits (1 s, doubling to 30 s) before the next round. A
+session that stayed up resets the wait. Restarting the client starts again at
+`server`.
+
+A backup can be the **same server at another address** — for example its IP
+address, in case the hostname is blocked or its DNS is tampered with:
+
+```toml
+server = "vpn.example.com:8444"
+backup_servers = ["203.0.113.10:8444"]
+```
+
+or a **second server**. A second server either has its own key (give it as
+`public_key`) or a copy of the primary's `private_key`; either way its
+`allowed_clients` must list the same client keys.
 
 Settings from older versions (`tls_sni`, `tls_profile`, `enable_padding`,
 `tls_cert`, `tls_key`, `decoy_site`) never had any effect and have been
@@ -326,6 +392,10 @@ iptables -A OUTPUT -j DROP
 **"Handshake failed" / "Handshake timed out"**
 - Check `server_public_key` matches the server's `public_key`
 - Check nothing between client and server is resetting the connection
+
+**"closed the connection right after the handshake"**
+- The server does not have this client's public key in `allowed_clients`.
+  The log line ends with the key to add. Restart the server after adding it.
 
 ### Performance Issues
 

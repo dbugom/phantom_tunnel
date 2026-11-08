@@ -29,6 +29,14 @@ socks5_listen = "127.0.0.1:1080"
 # Set to empty string to disable HTTP proxy
 http_listen = "127.0.0.1:8080"
 
+# Backup servers, tried in order when `server` can't be reached or refuses
+# this client. "host:port" alone uses server_public_key; give a public_key for
+# a server with a different key.
+# backup_servers = [
+#     "203.0.113.10:443",
+#     { address = "backup.example.net:443", public_key = "BACKUP_SERVER_PUBLIC_KEY" },
+# ]
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

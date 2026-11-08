@@ -1,16 +1,17 @@
 //! Phantom Tunnel Server
 //!
-//! A secure, censorship-resistant tunnel server that:
-//! - Accepts client connections over TLS
-//! - Performs Noise Protocol handshake
-//! - Multiplexes streams to target destinations
-//! - Resists active probing attacks
+//! - Accepts client connections (length-prefixed Noise over plain TCP)
+//! - Performs the Noise IK handshake and checks the client allow-list
+//! - Relays multiplexed streams and UDP associations to their destinations
+//!
+//! `phantom-server link` prints a `phantom://` connect link for clients.
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
+    link::{self, ConnectLink},
     tunnel::{
         udp, Frame, FrameType, InboundRx, InboundTx, RecvWindow, StreamFlow, DEFAULT_WINDOW_SIZE,
         MAX_WINDOW_SIZE, PROTOCOL_VERSION,
@@ -31,7 +32,7 @@ use tracing::{debug, error, info, trace, warn};
 #[command(version)]
 struct Args {
     /// Configuration file path
-    #[arg(short, long, default_value = "config.toml")]
+    #[arg(short, long, default_value = "config.toml", global = true)]
     config: String,
 
     /// Generate new keypair and exit
@@ -45,6 +46,36 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'v', long, default_value = "info")]
     log_level: String,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(clap::Subcommand, Debug)]
+enum Command {
+    /// Print a phantom:// connect link for this server and exit. Clients set
+    /// themselves up with `phantom-client --import LINK`.
+    Link {
+        /// Address clients dial: host or host:port. Without a port, the port
+        /// from `listen` is used.
+        #[arg(long)]
+        address: String,
+
+        /// Backup server clients try, in order, if this one can't be reached:
+        /// host:port (same server key) or KEY@host:port. Repeatable.
+        #[arg(long = "backup", value_name = "[KEY@]HOST:PORT")]
+        backups: Vec<String>,
+
+        /// Name of the person or device, shown when the link is imported.
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Generate a key pair for the client and put its private key in the
+        /// link, so the recipient doesn't have to send a key back. The link is
+        /// then a credential. Prints the public key to add to allowed_clients.
+        #[arg(long)]
+        new_client_key: bool,
+    },
 }
 
 /// Server state shared across connections
@@ -118,6 +149,17 @@ async fn main() -> Result<()> {
         .clone()
         .ok_or_else(|| anyhow!("No [server] section in config file"))?;
 
+    if let Some(Command::Link {
+        address,
+        backups,
+        label,
+        new_client_key,
+    }) = &args.command
+    {
+        let listen = args.listen.as_deref().unwrap_or(&server_config.listen);
+        return print_link(&server_config, listen, address, backups, label.as_deref(), *new_client_key);
+    }
+
     // Parse or generate server keypair
     let keypair = if server_config.private_key.is_empty() {
         // No keys configured - generate new keypair and save to config
@@ -141,20 +183,17 @@ async fn main() -> Result<()> {
         let private_key = PrivateKey::from_base64(&server_config.private_key)
             .context("Invalid private key format")?;
 
-        let public_key = if server_config.public_key.is_empty() {
-            // Old config without public key - we can't derive it, so error
-            error!("Config has private_key but no public_key");
-            error!("Please regenerate keys or add public_key to config");
-            return Err(anyhow!("Missing public_key in config"));
-        } else {
-            PublicKey::from_base64(&server_config.public_key)
-                .context("Invalid public key format")?
-        };
-
-        KeyPair {
-            public: public_key,
-            private: private_key,
+        // Derived from the private key: this is the key clients must pin.
+        let pair = KeyPair::from_private(private_key);
+        if !server_config.public_key.is_empty()
+            && server_config.public_key != pair.public.to_base64()
+        {
+            warn!(
+                "public_key in the config does not match private_key; clients must use {}",
+                pair.public.to_base64()
+            );
         }
+        pair
     };
 
     // Parse allowed clients
@@ -237,6 +276,113 @@ fn generate_keypair() -> Result<()> {
     println!("  server_public_key = \"{}\"", keypair.public.to_base64());
 
     Ok(())
+}
+
+/// `phantom-server link`: print a connect link for clients of this server.
+fn print_link(
+    server_config: &phantom_tunnel::config::ServerConfig,
+    listen: &str,
+    address: &str,
+    backups: &[String],
+    label: Option<&str>,
+    new_client_key: bool,
+) -> Result<()> {
+    // Prefer the key derived from private_key: it is what the handshake uses.
+    let server_public_key = if !server_config.private_key.is_empty() {
+        PrivateKey::from_base64(&server_config.private_key)
+            .context("Invalid private_key in config")?
+            .public_key()
+    } else if !server_config.public_key.is_empty() {
+        PublicKey::from_base64(&server_config.public_key).context("Invalid public_key in config")?
+    } else {
+        return Err(anyhow!(
+            "The server has no key yet. Start it once to generate one, then make the link."
+        ));
+    };
+
+    let server = complete_address(address, listen)?;
+    let backups = backups
+        .iter()
+        .map(|b| link::parse_backup(b.trim()).with_context(|| format!("--backup {}", b)))
+        .collect::<Result<Vec<_>>>()?;
+    if backups.len() > link::MAX_BACKUPS {
+        return Err(anyhow!("At most {} backup servers", link::MAX_BACKUPS));
+    }
+    let client = if new_client_key {
+        Some(KeyPair::generate()?)
+    } else {
+        None
+    };
+
+    let text = ConnectLink {
+        server,
+        server_public_key,
+        backups,
+        client_private_key: client.as_ref().map(|c| c.private.clone()),
+        label: label.map(str::to_string),
+    }
+    .to_string();
+    // Round-trip through the parser so we never hand out a link the client
+    // would reject.
+    ConnectLink::parse(&text).context("Generated link failed to parse (bug)")?;
+
+    // The link alone on stdout, so `LINK=$(phantom-server link ...)` works;
+    // instructions on stderr.
+    println!("{}", text);
+    eprintln!();
+    eprintln!("On the client:  phantom-client -c config.toml --import -   (then paste the link)");
+    match &client {
+        Some(c) => {
+            eprintln!();
+            eprintln!("This link contains a private key: send it privately, to one person.");
+            eprintln!("Authorise it by adding this line to allowed_clients, then restart the server:");
+            eprintln!(
+                "    \"{}\",  # {}",
+                c.public.to_base64(),
+                label.unwrap_or("new client")
+            );
+        }
+        None => {
+            eprintln!();
+            eprintln!("The link has no client key. Importing it prints the device's public key;");
+            eprintln!("add that key to allowed_clients to let it connect.");
+        }
+    }
+    Ok(())
+}
+
+/// Accept `host`, `host:port`, `[v6]` or `[v6]:port`, filling in the port from
+/// the listen address when it is missing. Refuses wildcard addresses
+/// (0.0.0.0, ::), which clients can't dial.
+fn complete_address(address: &str, listen: &str) -> Result<String> {
+    let address = address.trim();
+    let has_port = if address.starts_with('[') {
+        address.contains("]:")
+    } else {
+        address.contains(':')
+    };
+    let full = if has_port {
+        address.to_string()
+    } else {
+        let port = listen
+            .rsplit_once(':')
+            .map(|(_, p)| p)
+            .ok_or_else(|| anyhow!("--address has no port and listen ({}) has none either", listen))?;
+        format!("{}:{}", address, port)
+    };
+    link::validate_address(&full, "--address")?;
+    let host = full.rsplit_once(':').map(|(h, _)| h).unwrap_or(&full);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        // Loopback stays allowed: it is valid behind an SSH port forward.
+        if ip.is_unspecified() {
+            return Err(anyhow!(
+                "--address {} is not reachable by clients; use this server's public hostname or IP",
+                full
+            ));
+        }
+    }
+    Ok(full)
 }
 
 /// Message from the reader task

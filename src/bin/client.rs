@@ -1,16 +1,19 @@
 //! Phantom Tunnel Client
 //!
-//! A secure, censorship-resistant tunnel client that:
-//! - Connects to server with TLS fingerprint mimicry
-//! - Performs Noise Protocol handshake
-//! - Runs local SOCKS5/HTTP proxy
-//! - Multiplexes connections through tunnel
+//! - Connects to the server (falling back to `backup_servers` in order)
+//! - Performs the Noise IK handshake
+//! - Runs the local SOCKS5 / HTTP CONNECT proxies
+//! - Multiplexes connections through the tunnel
+//!
+//! `--import LINK` writes a config from a `phantom://` connect link and
+//! `--share-link` prints one for the current config (see `phantom_tunnel::link`).
 
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use phantom_tunnel::{
-    config::Config,
+    config::{ClientConfig, Config},
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
+    link::{self, ConnectLink, KeySource},
     tunnel::{
         udp, Frame, FrameType, InboundRx, InboundTx, RecvWindow, StreamFlow, DEFAULT_WINDOW_SIZE,
         MAX_STREAMS, MAX_WINDOW_SIZE, PROTOCOL_VERSION,
@@ -22,7 +25,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Phantom Tunnel Client - Secure, censorship-resistant tunnel
 #[derive(Parser, Debug)]
@@ -58,16 +61,71 @@ struct Args {
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'v', long, default_value = "info")]
     log_level: String,
+
+    /// Write the config file from a phantom:// connect link, then exit. Use
+    /// `--import -` to read the link from standard input, which keeps a link
+    /// that contains a private key out of your shell history.
+    #[arg(long, value_name = "LINK")]
+    import: Option<String>,
+
+    /// With --import: replace the server settings in an existing config file
+    /// (a copy of the old file is kept as CONFIG.bak).
+    #[arg(long, requires = "import")]
+    force: bool,
+
+    /// Print a connect link for this config's servers and exit. The link does
+    /// not contain this device's private key.
+    #[arg(long, conflicts_with = "import")]
+    share_link: bool,
+}
+
+/// One server the client can use.
+struct Endpoint {
+    /// `host:port`
+    addr: String,
+    /// The server's static public key.
+    public_key: PublicKey,
 }
 
 /// Client state
 struct ClientState {
     /// Client's keypair
     keypair: KeyPair,
-    /// Server's public key
-    server_public: PublicKey,
-    /// Server address
-    server_addr: String,
+    /// Primary server first, then the backups, in the order to try them.
+    servers: Vec<Endpoint>,
+}
+
+impl ClientState {
+    /// "primary server" / "backup server 2", for log messages.
+    fn describe(&self, index: usize) -> String {
+        if index == 0 {
+            format!("primary server {}", self.servers[0].addr)
+        } else {
+            format!("backup server {} ({})", index, self.servers[index].addr)
+        }
+    }
+}
+
+/// What one connection attempt achieved; decides whether to fail over.
+#[derive(Default)]
+struct SessionStats {
+    /// When the Noise handshake completed.
+    established_at: Option<tokio::time::Instant>,
+    /// Frames received from the server after the handshake.
+    frames_received: u64,
+}
+
+impl SessionStats {
+    /// A session counts as working once the server has sent us something, or it
+    /// stayed up for a while. A server that rejects our key completes the
+    /// handshake and then closes at once, which must count as a failure.
+    /// Call it right after the session ends.
+    fn healthy(&self) -> bool {
+        match self.established_at {
+            Some(t) => self.frames_received > 0 || t.elapsed() >= HEALTHY_AFTER,
+            None => false,
+        }
+    }
 }
 
 /// Request to open a new stream through the tunnel
@@ -162,9 +220,20 @@ async fn main() -> Result<()> {
     if args.generate_key {
         return generate_keypair();
     }
+    if let Some(link_arg) = &args.import {
+        return import_link(&args.config, link_arg, args.force);
+    }
 
     // Load configuration
     let mut config = Config::load(&args.config).context("Failed to load configuration")?;
+
+    if args.share_link {
+        let client = config
+            .client
+            .as_ref()
+            .ok_or_else(|| anyhow!("No [client] section in config file"))?;
+        return share_link(client);
+    }
 
     let client_config = config
         .client
@@ -179,6 +248,26 @@ async fn main() -> Result<()> {
 
     let server_public = PublicKey::from_base64(&client_config.server_public_key)
         .context("Invalid server public key")?;
+
+    // Primary first, then backups in config order.
+    let mut servers = vec![Endpoint {
+        addr: args.server.clone().unwrap_or_else(|| client_config.server.clone()),
+        public_key: server_public.clone(),
+    }];
+    for (i, b) in client_config.backup_servers.iter().enumerate() {
+        link::validate_address(&b.address, "backup")
+            .with_context(|| format!("backup_servers entry {}", i + 1))?;
+        let public_key = if b.public_key.is_empty() {
+            server_public.clone()
+        } else {
+            PublicKey::from_base64(&b.public_key)
+                .with_context(|| format!("Invalid public_key for backup server {}", b.address))?
+        };
+        servers.push(Endpoint {
+            addr: b.address.clone(),
+            public_key,
+        });
+    }
 
     // Parse or generate client keypair
     let keypair = if client_config.private_key.is_empty() {
@@ -203,31 +292,29 @@ async fn main() -> Result<()> {
         let private_key = PrivateKey::from_base64(&client_config.private_key)
             .context("Invalid private key format")?;
 
-        let public_key = if client_config.public_key.is_empty() {
-            // Old config without public key - can't derive, error out
-            error!("Config has private_key but no public_key");
-            error!("Please regenerate keys or add public_key to config");
-            return Err(anyhow!("Missing public_key in config"));
-        } else {
-            PublicKey::from_base64(&client_config.public_key)
-                .context("Invalid public key format")?
-        };
-
-        KeyPair {
-            public: public_key,
-            private: private_key,
+        // The public key is derived from the private key; that is what the
+        // server sees. The copy in the config is only for the user to share.
+        let pair = KeyPair::from_private(private_key);
+        if !client_config.public_key.is_empty()
+            && client_config.public_key != pair.public.to_base64()
+        {
+            warn!(
+                "public_key in the config does not match private_key; the server sees {}",
+                pair.public.to_base64()
+            );
         }
+        pair
     };
 
     // Create client state
-    let state = Arc::new(ClientState {
-        keypair,
-        server_public,
-        server_addr: args.server.unwrap_or(client_config.server),
-    });
+    let state = Arc::new(ClientState { keypair, servers });
 
     info!("Phantom Tunnel Client v{}", phantom_tunnel::VERSION);
-    info!("Server: {}", state.server_addr);
+    info!("Server: {}", state.servers[0].addr);
+    if state.servers.len() > 1 {
+        let backups: Vec<&str> = state.servers[1..].iter().map(|e| e.addr.as_str()).collect();
+        info!("Backup servers: {}", backups.join(", "));
+    }
     info!("Client public key: {}...", &state.keypair.public.to_base64()[..16]);
 
     // Start local proxies
@@ -246,26 +333,61 @@ async fn main() -> Result<()> {
     // so queued/incoming proxy commands survive a dropped connection.
     let mut tunnel_cmd_rx = cmd_rx;
     let tunnel_task = tokio::spawn(async move {
-        // Exponential backoff with jitter, reset after a successful session.
+        let n = tunnel_state.servers.len();
+        // Server to dial next. The client sticks with whichever server last
+        // worked; when one fails it moves straight on to the next in the list,
+        // and only backs off once every server has failed in a row.
+        let mut current = 0usize;
+        let mut failed_in_round = 0usize;
+        // Exponential backoff with jitter, reset after a working session.
         let mut backoff_secs: u64 = 1;
         loop {
-            match run_tunnel(Arc::clone(&tunnel_state), &mut tunnel_cmd_rx).await {
-                Ok(_) => {
-                    info!("Tunnel closed; reconnecting shortly...");
-                    backoff_secs = 1;
-                }
-                Err(e) => {
-                    error!("Tunnel error: {}", e);
-                }
+            let mut stats = SessionStats::default();
+            let result =
+                run_tunnel(Arc::clone(&tunnel_state), current, &mut tunnel_cmd_rx, &mut stats).await;
+            // Judge the session once, now that it has ended: healthy() looks at
+            // the time since the handshake, which keeps growing while we sleep.
+            let healthy = stats.healthy();
+            let what = tunnel_state.describe(current);
+            match &result {
+                Ok(()) => info!("Tunnel to {} closed", what),
+                Err(e) => error!("Tunnel to {}: {:#}", what, e),
             }
+            if stats.established_at.is_some() && !healthy {
+                warn!(
+                    "{} closed the connection right after the handshake. This usually means \
+                     this client's public key is not in its allowed_clients: {}",
+                    what,
+                    tunnel_state.keypair.public.to_base64()
+                );
+            }
+
+            if healthy {
+                failed_in_round = 0;
+                backoff_secs = 1;
+            } else {
+                failed_in_round += 1;
+                if n > 1 {
+                    current = (current + 1) % n;
+                    if failed_in_round < n {
+                        info!("Trying {}...", tunnel_state.describe(current));
+                        continue;
+                    }
+                }
+                // Every server failed this round; back off before the next one.
+                failed_in_round = 0;
+            }
+
             // Small jitter so many clients don't reconnect in lockstep (which
             // would itself be a detectable traffic signature).
             let jitter_ms = (tunnel_state.keypair.public.as_bytes()[0] as u64) * 8;
             let wait = std::time::Duration::from_secs(backoff_secs)
                 + std::time::Duration::from_millis(jitter_ms);
-            info!("Reconnecting in ~{}s...", backoff_secs);
+            info!("Reconnecting to {} in ~{}s...", tunnel_state.describe(current), backoff_secs);
             tokio::time::sleep(wait).await;
-            backoff_secs = (backoff_secs * 2).min(30);
+            if !healthy {
+                backoff_secs = (backoff_secs * 2).min(30);
+            }
         }
     });
 
@@ -329,6 +451,112 @@ fn generate_keypair() -> Result<()> {
     Ok(())
 }
 
+/// `--import`: write (or update) the client config from a connect link.
+fn import_link(config_path: &str, link_arg: &str, force: bool) -> Result<()> {
+    use std::io::{BufRead, IsTerminal, Write};
+
+    let from_stdin = link_arg == "-";
+    let text = if from_stdin {
+        if std::io::stdin().is_terminal() {
+            eprint!("Paste the phantom:// link and press Enter: ");
+            std::io::stderr().flush().ok();
+        }
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line).context("Failed to read link from stdin")?;
+        line
+    } else {
+        link_arg.to_string()
+    };
+    let link = ConnectLink::parse(&text).context("Invalid connect link")?;
+
+    let path = std::path::Path::new(config_path);
+    let existing = if path.exists() {
+        if !force {
+            return Err(anyhow!(
+                "{} already exists. Re-run with --force to replace its server settings \
+                 (this device's key and proxy ports are kept unless the link contains a key; \
+                 the old file is saved as {}.bak).",
+                config_path,
+                config_path
+            ));
+        }
+        let cfg = Config::load(path).with_context(|| {
+            format!("{} exists but cannot be read; move it aside and import again", config_path)
+        })?;
+        // Rewriting a server config would drop its comments, including the
+        // labels next to allowed_clients entries.
+        if cfg.server.is_some() {
+            return Err(anyhow!(
+                "{} has a [server] section; refusing to rewrite a server config. \
+                 Import into a separate client config file.",
+                config_path
+            ));
+        }
+        Some(cfg)
+    } else {
+        None
+    };
+
+    let existing_client = existing.as_ref().and_then(|c| c.client.as_ref());
+    let (client, source) = link.to_client_config(existing_client)?;
+
+    if existing.is_some() {
+        let backup = format!("{}.bak", config_path);
+        std::fs::copy(path, &backup).with_context(|| format!("Failed to back up to {}", backup))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&backup, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    let mut config = existing.unwrap_or_default();
+    config.client = Some(client.clone());
+    config.save(path).context("Failed to write config")?;
+
+    println!("Wrote {}", config_path);
+    if let Some(label) = &link.label {
+        println!("  Label:   {}", label);
+    }
+    println!("  Server:  {}", client.server);
+    for b in &client.backup_servers {
+        println!("  Backup:  {}", b.address);
+    }
+    println!();
+    match source {
+        KeySource::FromLink => {
+            println!("The link included a key issued by the server admin for this device.");
+            if !from_stdin {
+                println!("It is a credential: clear it from your shell history if you pasted it on the command line.");
+            }
+        }
+        KeySource::Kept => {
+            println!("Kept this device's existing key. Its public key (already given to the admin, if it worked before):");
+            println!("  {}", client.public_key);
+        }
+        KeySource::Generated => {
+            println!("Generated a new key for this device. Send this public key to the server admin");
+            println!("so they can add it to allowed_clients:");
+            println!("  {}", client.public_key);
+        }
+    }
+    println!();
+    println!("Start the tunnel with:");
+    println!("  phantom-client -c {}", config_path);
+    Ok(())
+}
+
+/// `--share-link`: print a link for this config's servers, without the
+/// device's private key.
+fn share_link(client: &ClientConfig) -> Result<()> {
+    let link = ConnectLink::from_client_config(client, false)?;
+    println!("{}", link);
+    eprintln!();
+    eprintln!("This link contains the server address(es) and server key, not this device's");
+    eprintln!("private key. Whoever imports it gets a new key of their own, which the server");
+    eprintln!("admin must add to allowed_clients before it can connect.");
+    Ok(())
+}
+
 /// Active stream state in the tunnel
 struct ActiveStream {
     /// Forwards inbound payloads to the local consumer task.
@@ -363,32 +591,48 @@ const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2
 const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Initial per-stream send window as a signed credit count.
 const INITIAL_WINDOW: i64 = DEFAULT_WINDOW_SIZE as i64;
+/// Give up on a server that doesn't accept the TCP connection in this time
+/// (DNS lookup included) and try the next one. Without it a black-holed
+/// address stalls the client for the OS default of a minute or more.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Give up on a server that accepts the connection but doesn't answer the
+/// handshake.
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// A session that lasted this long counts as working even if idle.
+const HEALTHY_AFTER: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Run the tunnel connection to server
+/// Run the tunnel connection to `state.servers[server]`, recording progress in
+/// `stats` so the caller can tell a refused connection from a dropped one.
 async fn run_tunnel(
     state: Arc<ClientState>,
+    server: usize,
     cmd_rx: &mut mpsc::Receiver<TunnelCommand>,
+    stats: &mut SessionStats,
 ) -> Result<()> {
+    let endpoint = &state.servers[server];
+
     // Connect to server
-    let stream = TcpStream::connect(&state.server_addr)
+    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&endpoint.addr))
         .await
-        .context("Failed to connect to server")?;
+        .map_err(|_| anyhow!("timed out connecting after {}s", CONNECT_TIMEOUT.as_secs()))?
+        .context("Failed to connect")?;
     // Disable Nagle to avoid ~40ms delayed-ACK stalls on our small frames.
     stream.set_nodelay(true).ok();
 
-    info!("Connected to server, performing handshake...");
+    info!("Connected to {}, performing handshake...", endpoint.addr);
 
     // Split stream for handshake (we'll need both halves)
     let (mut read_half, mut write_half) = stream.into_split();
 
     // Perform Noise handshake using both halves
-    let (mut noise_transport, peer_version) = match perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &state.server_public).await {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Handshake failed: {:?}", e);
-            return Err(e.context("Handshake failed"));
-        }
-    };
+    let (mut noise_transport, peer_version) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &endpoint.public_key),
+    )
+    .await
+    .map_err(|_| anyhow!("handshake timed out after {}s", HANDSHAKE_TIMEOUT.as_secs()))?
+    .context("Handshake failed (wrong server key, or not a Phantom Tunnel server?)")?;
+    stats.established_at = Some(tokio::time::Instant::now());
 
     // Flow control and UDP require a v2 server. Against a v1 server we fall back
     // to the previous behaviour (no flow control, blocking forward).
@@ -468,6 +712,7 @@ async fn run_tunnel(
                 match msg {
                     ReaderMessage::Frame(encrypted_data) => {
                         last_recv = tokio::time::Instant::now();
+                        stats.frames_received += 1;
 
                         // Decrypt frame
                         let plaintext_len = match noise_transport.decrypt(&encrypted_data, &mut frame_buf) {
