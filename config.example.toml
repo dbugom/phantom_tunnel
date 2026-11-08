@@ -31,15 +31,6 @@ allowed_clients = [
     # "client2_public_key_base64",
 ]
 
-# TLS certificate for obfuscation layer
-# If not provided, uses self-signed (less effective camouflage)
-# tls_cert = "/etc/phantom-tunnel/cert.pem"
-# tls_key = "/etc/phantom-tunnel/key.pem"
-
-# Decoy website to serve for invalid/probe requests
-# This helps resist active probing attacks
-# decoy_site = "https://example.com"
-
 # Maximum concurrent connections
 max_connections = 1000
 
@@ -65,13 +56,3 @@ socks5_listen = "127.0.0.1:1080"
 
 # Local HTTP proxy address (optional)
 http_listen = "127.0.0.1:8080"
-
-# TLS SNI to use for camouflage
-# Should be a legitimate site hosted on similar infrastructure
-# tls_sni = "www.google.com"
-
-# TLS fingerprint profile: chrome, firefox, safari, edge
-tls_profile = "chrome"
-
-# Enable traffic padding (recommended for censored networks)
-enable_padding = true

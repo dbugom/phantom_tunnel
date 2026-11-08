@@ -1,19 +1,13 @@
-//! Integration tests for Phantom Tunnel
-//!
-//! Tests the full client-server communication flow including:
-//! - Noise Protocol handshake
-//! - Stream multiplexing
+//! Integration tests for the Phantom Tunnel library:
+//! - Noise IK handshake over real TCP sockets
 //! - Encrypted data transfer
-//! - Flow control
+//! - Frame format, including its exact on-wire layout
 
 use bytes::Bytes;
 use phantom_tunnel::crypto::{KeyPair, NoiseHandshake};
-use phantom_tunnel::tunnel::{Frame, FrameType, Multiplexer, FRAME_HEADER_SIZE};
-use std::net::SocketAddr;
-use std::sync::Arc;
+use phantom_tunnel::tunnel::{Frame, FrameType, FRAME_HEADER_SIZE};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
 
 /// Test basic Noise IK handshake between client and server
 #[tokio::test]
@@ -104,12 +98,12 @@ async fn test_noise_handshake() {
         .expect("Failed to read response");
 
     // Convert to transport
-    let client_transport = client_handshake
+    let _client_transport = client_handshake
         .into_transport()
         .expect("Failed to enter transport mode");
 
     // Wait for server
-    let (server_transport, client_pub_from_server) = server_handle.await.unwrap();
+    let (_server_transport, client_pub_from_server) = server_handle.await.unwrap();
 
     // Verify handshake completed
     assert_eq!(
@@ -226,82 +220,91 @@ async fn test_frame_roundtrip() {
     assert_eq!(&decoded.payload[..], test_data);
 }
 
-/// Test stream multiplexer
-#[tokio::test]
-async fn test_multiplexer_operations() {
-    let mut client_mux = Multiplexer::new_client();
-
-    // Client opens stream
-    let stream_handle = client_mux.open_stream("example.com:443".to_string()).unwrap();
-    assert_eq!(stream_handle.id(), 1); // Odd for client
-
-    // Get queued STREAM_OPEN frame
-    let frames = client_mux.take_send_queue();
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].frame_type, FrameType::StreamOpen);
-
-    // Verify the frame structure
-    assert_eq!(frames[0].stream_id, 1);
-    // The payload contains the destination as raw bytes
-    assert!(!frames[0].payload.is_empty());
+/// The frame layout on the wire must not change: deployed v1 and v2 peers
+/// depend on it. type(1) | stream_id(3, BE) | payload_len(2, BE) | padding_len(1)
+/// | payload | padding.
+#[test]
+fn test_frame_wire_layout_is_stable() {
+    let frame = Frame::data(0x010203, Bytes::from_static(b"hi"));
+    let encoded = frame.encode();
+    assert_eq!(
+        &encoded[..],
+        &[0x00, 0x01, 0x02, 0x03, 0x00, 0x02, 0x00, b'h', b'i'],
+        "frame wire format changed"
+    );
+    assert_eq!(FRAME_HEADER_SIZE, 7);
+    assert_eq!(frame.encoded_size(), encoded.len());
 }
 
-/// Test ping/pong keepalive
-#[tokio::test]
-async fn test_ping_pong() {
-    let mut mux = Multiplexer::new_client();
-
-    // Send ping
-    mux.send_ping();
-    let frames = mux.take_send_queue();
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].frame_type, FrameType::Ping);
-
-    // Simulate receiving ping on other side
-    let mut other_mux = Multiplexer::new_server();
-    other_mux.handle_frame(frames[0].clone()).await.unwrap();
-
-    // Should have pong queued
-    let pong_frames = other_mux.take_send_queue();
-    assert_eq!(pong_frames.len(), 1);
-    assert_eq!(pong_frames[0].frame_type, FrameType::Pong);
+/// Ping/Pong frames carry an 8-byte big-endian value that must survive a
+/// round trip (the peer echoes it back).
+#[test]
+fn test_ping_pong_frames() {
+    for (frame, ty) in [
+        (Frame::ping(0xDEAD_BEEF_0000_0042), FrameType::Ping),
+        (Frame::pong(0xDEAD_BEEF_0000_0042), FrameType::Pong),
+    ] {
+        let mut buf = frame.encode();
+        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.frame_type, ty);
+        assert_eq!(decoded.stream_id, 0);
+        assert_eq!(
+            u64::from_be_bytes(decoded.payload[..8].try_into().unwrap()),
+            0xDEAD_BEEF_0000_0042
+        );
+        assert!(buf.is_empty(), "decode must consume the whole frame");
+    }
 }
 
-/// Test traffic padding
-#[tokio::test]
-async fn test_padding_frames() {
-    let mut mux = Multiplexer::new_client();
+/// Padding frames carry random padding and no payload; the decoder discards
+/// the padding.
+#[test]
+fn test_padding_frame() {
+    let frame = Frame::padding(255);
+    let a = frame.encode();
+    let b = frame.encode();
+    assert_eq!(a.len(), FRAME_HEADER_SIZE + 255);
+    assert_ne!(a[FRAME_HEADER_SIZE..], b[FRAME_HEADER_SIZE..], "padding must be random");
 
-    // Send padding (max 255 due to u8 padding_len field)
-    mux.send_padding(255);
-    let frames = mux.take_send_queue();
-    assert_eq!(frames.len(), 1);
-    assert_eq!(frames[0].frame_type, FrameType::Padding);
-    // Padding is stored in padding_len, not payload
-    assert_eq!(frames[0].padding_len, 255);
-    assert!(frames[0].payload.is_empty()); // No actual payload data
+    let mut buf = a;
+    let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.frame_type, FrameType::Padding);
+    assert_eq!(decoded.padding_len, 255);
+    assert!(decoded.payload.is_empty());
+    assert!(buf.is_empty());
 }
 
-/// Test multiple concurrent streams
-#[tokio::test]
-async fn test_multiple_streams() {
-    let mut mux = Multiplexer::new_client();
+/// Several frames back to back in one buffer decode one at a time, and a
+/// truncated frame waits for more bytes instead of failing.
+#[test]
+fn test_frames_back_to_back_and_partial() {
+    let mut buf = bytes::BytesMut::new();
+    buf.extend_from_slice(&Frame::stream_open(1, b"example.com:443").encode());
+    buf.extend_from_slice(&Frame::window_update(1, 65536).encode());
+    buf.extend_from_slice(&Frame::udp_data(3, Bytes::from_static(b"dgram")).encode());
+    buf.extend_from_slice(&Frame::stream_close(1).encode());
 
-    // Open multiple streams
-    let stream1 = mux.open_stream("example.com:443".to_string()).unwrap();
-    let stream2 = mux.open_stream("example.org:443".to_string()).unwrap();
-    let stream3 = mux.open_stream("example.net:443".to_string()).unwrap();
+    let kinds: Vec<FrameType> = std::iter::from_fn(|| Frame::decode(&mut buf).unwrap())
+        .map(|f| f.frame_type)
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![FrameType::StreamOpen, FrameType::WindowUpdate, FrameType::UdpData, FrameType::StreamClose]
+    );
 
-    assert_eq!(stream1.id(), 1);
-    assert_eq!(stream2.id(), 3);
-    assert_eq!(stream3.id(), 5);
+    // Every proper prefix of a frame is "not enough data yet", never an error.
+    let full = Frame::data(9, Bytes::from_static(b"payload")).encode();
+    for cut in 0..full.len() {
+        let mut part = bytes::BytesMut::from(&full[..cut]);
+        assert!(Frame::decode(&mut part).unwrap().is_none(), "prefix of {} bytes", cut);
+    }
+}
 
-    assert_eq!(mux.stream_count(), 3);
-
-    // All should be odd (client-initiated)
-    assert!(stream1.id() % 2 == 1);
-    assert!(stream2.id() % 2 == 1);
-    assert!(stream3.id() % 2 == 1);
+/// An unknown frame type is rejected, not misread.
+#[test]
+fn test_unknown_frame_type_rejected() {
+    let mut buf = bytes::BytesMut::from(&[0x7f, 0, 0, 1, 0, 0, 0][..]);
+    assert!(Frame::decode(&mut buf).is_err());
 }
 
 /// Test bidirectional encrypted data transfer
@@ -519,27 +522,6 @@ async fn test_large_data_transfer() {
     let received = server_handle.await.unwrap();
     assert_eq!(received.len(), test_data_clone.len());
     assert_eq!(received, test_data_clone);
-}
-
-/// Test key derivation consistency
-#[test]
-fn test_key_derivation_consistency() {
-    use phantom_tunnel::crypto::Hkdf;
-
-    let ikm = b"input key material";
-    let salt = b"salt value";
-    let info = b"info value";
-
-    let hkdf1 = Hkdf::new(Some(salt), ikm);
-    let hkdf2 = Hkdf::new(Some(salt), ikm);
-
-    let mut output1 = [0u8; 32];
-    let mut output2 = [0u8; 32];
-
-    hkdf1.expand(info, &mut output1).unwrap();
-    hkdf2.expand(info, &mut output2).unwrap();
-
-    assert_eq!(output1, output2);
 }
 
 /// Test keypair serialization

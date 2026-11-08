@@ -18,11 +18,9 @@
 use super::TunnelError;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
-/// Frame header size in bytes
-pub const FRAME_HEADER_SIZE: usize = 6;
-
-/// Maximum payload size (64 KB - header)
-pub const MAX_PAYLOAD_SIZE: usize = 65535 - FRAME_HEADER_SIZE;
+/// Frame header size in bytes: type (1) + stream id (3) + payload length (2)
+/// + padding length (1).
+pub const FRAME_HEADER_SIZE: usize = 7;
 
 /// Frame types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,10 +226,9 @@ impl Frame {
 
     /// Decode frame from bytes
     pub fn decode(buf: &mut BytesMut) -> Result<Option<Self>, TunnelError> {
-        // The on-wire header is 7 bytes: type(1) + stream_id(3) + payload_len(2)
-        // + padding_len(1). We must have all 7 before indexing buf[6] below,
-        // otherwise a short buffer would panic (fatal under panic=abort).
-        if buf.len() < FRAME_HEADER_SIZE + 1 {
+        // Need the whole 7-byte header before indexing buf[6] below; a short
+        // buffer would otherwise panic (fatal under panic=abort).
+        if buf.len() < FRAME_HEADER_SIZE {
             return Ok(None);
         }
 
@@ -242,14 +239,14 @@ impl Frame {
         let payload_len = ((buf[4] as usize) << 8) | (buf[5] as usize);
         let padding_len = buf[6] as usize;
 
-        let total_len = FRAME_HEADER_SIZE + 1 + payload_len + padding_len;
+        let total_len = FRAME_HEADER_SIZE + payload_len + padding_len;
 
         if buf.len() < total_len {
             return Ok(None);
         }
 
         // Consume header
-        buf.advance(FRAME_HEADER_SIZE + 1);
+        buf.advance(FRAME_HEADER_SIZE);
 
         // Read payload
         let payload = buf.split_to(payload_len).freeze();
@@ -267,7 +264,7 @@ impl Frame {
 
     /// Get the total encoded size of this frame
     pub fn encoded_size(&self) -> usize {
-        FRAME_HEADER_SIZE + 1 + self.payload.len() + self.padding_len as usize
+        FRAME_HEADER_SIZE + self.payload.len() + self.padding_len as usize
     }
 }
 
@@ -294,7 +291,7 @@ mod tests {
 
         assert_eq!(
             encoded.len(),
-            FRAME_HEADER_SIZE + 1 + 4 + 16
+            FRAME_HEADER_SIZE + 4 + 16
         );
     }
 

@@ -28,15 +28,6 @@ allowed_clients = [
 # Increase for high-traffic servers
 max_connections = 1000
 
-# TLS certificate for outer layer encryption
-# Recommended: Use Let's Encrypt
-# tls_cert = "/etc/letsencrypt/live/yourdomain.com/fullchain.pem"
-# tls_key = "/etc/letsencrypt/live/yourdomain.com/privkey.pem"
-
-# Decoy website path
-# Serves static content to non-tunnel requests (censorship resistance)
-# decoy_site = "/var/www/decoy"
-
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

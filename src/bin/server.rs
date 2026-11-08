@@ -11,7 +11,10 @@ use clap::Parser;
 use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
-    tunnel::{udp, Frame, FrameType, StreamFlow},
+    tunnel::{
+        udp, Frame, FrameType, StreamFlow, DEFAULT_WINDOW_SIZE, PROTOCOL_VERSION,
+        WINDOW_UPDATE_THRESHOLD,
+    },
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -84,12 +87,8 @@ fn remove_stream(streams: &mut HashMap<u32, ActiveStream>, id: u32) {
     }
 }
 
-/// Protocol version the server speaks. v2 adds flow control and UDP.
-const PROTOCOL_VERSION: u8 = 2;
-/// Initial per-stream send window (bytes).
-const INITIAL_WINDOW: i64 = 262144;
-/// Emit a WindowUpdate once this many delivered bytes have accumulated.
-const WINDOW_UPDATE_THRESHOLD: u32 = 131072;
+/// Initial per-stream send window as a signed credit count.
+const INITIAL_WINDOW: i64 = DEFAULT_WINDOW_SIZE as i64;
 
 #[tokio::main]
 async fn main() -> Result<()> {

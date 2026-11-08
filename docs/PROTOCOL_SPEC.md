@@ -4,6 +4,14 @@
 **Date:** February 2026
 **Status:** Draft
 
+> **Implementation status (November 2026).** The shipped client and server
+> implement the Noise IK handshake (§5), the frame format (§6), stream
+> multiplexing (§7), flow control (§8, protocol v2) and the UDP frames
+> described in §6.2. They do **not** implement the TLS outer layer, browser
+> fingerprint mimicry or traffic shaping described in §3–§4 and §9: on the wire
+> the protocol is `u16 length ║ Noise ciphertext` over plain TCP. Read those
+> sections as design notes, not as a description of the running software.
+
 ---
 
 ## Table of Contents

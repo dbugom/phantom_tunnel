@@ -1,5 +1,10 @@
 # Phantom Tunnel Deployment Guide
 
+> **Wire format:** Phantom Tunnel is encrypted (Noise IK) but not disguised —
+> it runs as length-prefixed Noise ciphertext over plain TCP, with no TLS
+> layer. Older versions of this guide described TLS certificates, browser
+> fingerprints, padding and DNS tunnelling; none of those were implemented.
+
 This guide covers deploying Phantom Tunnel for secure, censorship-resistant communication.
 
 ## Table of Contents
@@ -40,11 +45,8 @@ source ~/.cargo/env
 git clone https://github.com/yourusername/phantom_tunnel.git
 cd phantom_tunnel
 
-# Build with default features (TLS, SOCKS5, HTTP proxy)
+# Build
 cargo build --release
-
-# Build with all features
-cargo build --release --all-features
 
 # Build minimal (smaller binary)
 cargo build --profile release-small
@@ -92,12 +94,8 @@ allowed_clients = [
 ]
 max_connections = 1000
 
-# Optional: TLS configuration
-tls_cert = "/etc/phantom_tunnel/cert.pem"
-tls_key = "/etc/phantom_tunnel/key.pem"
-
-# Optional: Decoy website for censorship resistance
-decoy_site = "/var/www/decoy"
+# Refuse tunnelled connections to the server's own LAN/localhost (default)
+allow_private_destinations = false
 
 [logging]
 level = "info"
@@ -196,13 +194,6 @@ private_key = "YOUR_CLIENT_PRIVATE_KEY"
 socks5_listen = "127.0.0.1:1080"
 http_listen = "127.0.0.1:8080"
 
-# TLS settings for censorship resistance
-tls_sni = "cdn.cloudflare.com"  # Camouflage SNI
-tls_profile = "chrome"           # Browser fingerprint to mimic
-
-# Traffic obfuscation
-enable_padding = true
-
 [logging]
 level = "info"
 format = "pretty"
@@ -251,10 +242,8 @@ export ALL_PROXY=socks5://127.0.0.1:1080
 | `listen` | Address to listen on | `0.0.0.0:443` |
 | `private_key` | Server's private key (base64) | Required |
 | `allowed_clients` | List of allowed client public keys | `[]` |
-| `tls_cert` | Path to TLS certificate | None |
-| `tls_key` | Path to TLS private key | None |
-| `decoy_site` | Path to decoy website content | None |
 | `max_connections` | Maximum concurrent connections | `1000` |
+| `allow_private_destinations` | Let clients reach the server's LAN, localhost and cloud metadata addresses | `false` |
 
 ### Client Options
 
@@ -265,20 +254,11 @@ export ALL_PROXY=socks5://127.0.0.1:1080
 | `private_key` | Client's private key (base64) | Required |
 | `socks5_listen` | Local SOCKS5 proxy address | `127.0.0.1:1080` |
 | `http_listen` | Local HTTP proxy address | `127.0.0.1:8080` |
-| `tls_sni` | SNI to use for TLS handshake | Server hostname |
-| `tls_profile` | Browser fingerprint profile | `chrome` |
-| `enable_padding` | Enable traffic padding | `true` |
 
-### TLS Profiles
-
-Available TLS fingerprint profiles:
-- `chrome` - Chrome 120+ fingerprint
-- `firefox` - Firefox 120+ fingerprint
-- `safari` - Safari 17+ fingerprint
-- `edge` - Edge 120+ fingerprint
-- `ios_safari` - iOS Safari fingerprint
-- `android_chrome` - Android Chrome fingerprint
-- `random` - Random selection at startup
+Settings from older versions (`tls_sni`, `tls_profile`, `enable_padding`,
+`tls_cert`, `tls_key`, `decoy_site`) never had any effect and have been
+removed. Config files that still contain them load normally; the settings are
+ignored.
 
 ## Security Hardening
 
@@ -343,17 +323,15 @@ iptables -A OUTPUT -j DROP
 - Check key format (must be base64)
 - Ensure using correct server public key
 
-**"TLS handshake failed"**
-- Verify TLS certificate is valid
-- Check certificate chain is complete
-- Try different `tls_sni` value
+**"Handshake failed" / "Handshake timed out"**
+- Check `server_public_key` matches the server's `public_key`
+- Check nothing between client and server is resetting the connection
 
 ### Performance Issues
 
 **Slow connection**
 - Check server load: `htop`
 - Monitor bandwidth: `iftop`
-- Consider disabling padding if not in censored environment
 - Check for network congestion
 
 **High latency**
@@ -412,29 +390,8 @@ max_connections = 10000
 
 ### Client Optimization
 
-1. **Disable padding** if not needed:
-```toml
-[client]
-enable_padding = false
-```
-
-2. **Use HTTP/2** for multiplexing when connecting to modern servers
-
-3. **Connection pooling** is automatic - multiple streams share one tunnel
-
-## DNS Tunneling (Advanced)
-
-For extremely censored environments where TLS is blocked:
-
-```toml
-[client]
-# Use DNS tunneling as fallback
-transport = "dns"
-dns_base_domain = "t.yourdomain.com"
-dns_resolver = "8.8.8.8:53"
-```
-
-**Note:** DNS tunneling is much slower but extremely difficult to block.
+1. **Connection sharing is automatic** — all proxied connections share one
+   tunnel connection, with per-stream flow control
 
 ## Support
 

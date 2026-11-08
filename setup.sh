@@ -214,31 +214,6 @@ setup_client() {
     HTTP_ADDR=${HTTP_ADDR:-"127.0.0.1:8080"}
     echo ""
 
-    # TLS profile
-    echo -e "${CYAN}TLS fingerprint profile${NC}"
-    info "This makes your traffic look like a specific browser"
-    echo "  1) chrome (recommended)"
-    echo "  2) firefox"
-    echo "  3) safari"
-    echo "  4) random"
-    read -p "Select profile [1]: " PROFILE_CHOICE
-    case $PROFILE_CHOICE in
-        2) TLS_PROFILE="firefox" ;;
-        3) TLS_PROFILE="safari" ;;
-        4) TLS_PROFILE="random" ;;
-        *) TLS_PROFILE="chrome" ;;
-    esac
-    echo ""
-
-    # Enable padding
-    read -p "Enable traffic padding? (recommended for censored networks) [Y/n]: " ENABLE_PADDING
-    if [[ "$ENABLE_PADDING" =~ ^[Nn]$ ]]; then
-        PADDING="false"
-    else
-        PADDING="true"
-    fi
-    echo ""
-
     # Config file path
     read -p "Config file path [client.toml]: " CONFIG_PATH
     CONFIG_PATH=${CONFIG_PATH:-"client.toml"}
@@ -262,12 +237,6 @@ public_key = "$PUBLIC_KEY"
 # Local proxy addresses
 socks5_listen = "$SOCKS5_ADDR"
 http_listen = "$HTTP_ADDR"
-
-# TLS fingerprint profile (chrome, firefox, safari, random)
-tls_profile = "$TLS_PROFILE"
-
-# Traffic padding (recommended for censored networks)
-enable_padding = $PADDING
 
 [logging]
 level = "info"

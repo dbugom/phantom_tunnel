@@ -1,58 +1,38 @@
 //! # Phantom Tunnel
 //!
-//! A secure, censorship-resistant tunneling protocol designed for privacy
-//! in highly restricted network environments.
+//! An encrypted, multiplexed TCP/UDP tunnel with a local SOCKS5 / HTTP CONNECT
+//! proxy on the client side.
 //!
-//! ## Features
+//! ## What is in the library
 //!
-//! - **End-to-end encryption** using Noise Protocol (IK pattern)
-//! - **TLS fingerprint mimicry** to evade deep packet inspection
-//! - **Traffic obfuscation** with padding and timing randomization
-//! - **Multiple transports**: TLS, QUIC, DNS tunneling
-//! - **SOCKS5 and HTTP CONNECT** proxy support
+//! - [`crypto`]: Noise IK handshake (`Noise_IK_25519_ChaChaPoly_SHA256`) and the
+//!   X25519 key types. Clients are authenticated by their static public key.
+//! - [`tunnel`]: the frame format carried inside Noise transport messages,
+//!   per-stream credit-based flow control ([`tunnel::StreamFlow`]), and the
+//!   address header used by UDP datagrams.
+//! - [`config`]: the TOML configuration shared by `phantom-server` and
+//!   `phantom-client`.
 //!
-//! ## Architecture
+//! The event loops themselves live in `src/bin/server.rs` and
+//! `src/bin/client.rs`.
+//!
+//! ## Wire format
 //!
 //! ```text
-//! ┌─────────────────────────────────────────────────────┐
-//! │                  Application Layer                   │
-//! │         (File Transfer, HTTP Proxy, SOCKS5)         │
-//! ├─────────────────────────────────────────────────────┤
-//! │                  Multiplexing Layer                  │
-//! │            (Multiple streams, flow control)          │
-//! ├─────────────────────────────────────────────────────┤
-//! │                   Tunnel Layer                       │
-//! │        (Encryption, authentication, framing)         │
-//! ├─────────────────────────────────────────────────────┤
-//! │                 Obfuscation Layer                    │
-//! │    (TLS mimicry, DNS tunneling, traffic shaping)    │
-//! ├─────────────────────────────────────────────────────┤
-//! │                  Transport Layer                     │
-//! │              (TCP, UDP, QUIC, WebSocket)             │
-//! └─────────────────────────────────────────────────────┘
+//! TCP  ──  u16 length ║ Noise ciphertext ( Frame ║ 16-byte tag )
 //! ```
+//!
+//! There is no TLS layer: the stream is length-prefixed Noise ciphertext over
+//! plain TCP. See `docs/PROTOCOL_SPEC.md`.
 
 pub mod config;
 pub mod crypto;
-pub mod obfuscation;
-pub mod protocol;
-pub mod proxy;
-pub mod transport;
 pub mod tunnel;
 
 pub use config::Config;
 
-/// Protocol version
+/// Crate version, as printed by `--version`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Protocol magic bytes for identification (internal use only)
-pub(crate) const MAGIC: [u8; 4] = [0x50, 0x48, 0x54, 0x4E]; // "PHTN"
-
-/// Maximum frame size (64 KB)
-pub const MAX_FRAME_SIZE: usize = 65535;
-
-/// Default port for phantom tunnel
-pub const DEFAULT_PORT: u16 = 443;
 
 /// Result type alias
 pub type Result<T> = std::result::Result<T, Error>;
@@ -66,27 +46,9 @@ pub enum Error {
     #[error("Crypto error: {0}")]
     Crypto(#[from] crypto::CryptoError),
 
-    #[error("Protocol error: {0}")]
-    Protocol(#[from] protocol::ProtocolError),
-
-    #[error("Transport error: {0}")]
-    Transport(#[from] transport::TransportError),
-
     #[error("Tunnel error: {0}")]
     Tunnel(#[from] tunnel::TunnelError),
 
-    #[error("Proxy error: {0}")]
-    Proxy(#[from] proxy::ProxyError),
-
     #[error("Configuration error: {0}")]
     Config(String),
-
-    #[error("Connection closed")]
-    ConnectionClosed,
-
-    #[error("Timeout")]
-    Timeout,
-
-    #[error("Authentication failed")]
-    AuthenticationFailed,
 }

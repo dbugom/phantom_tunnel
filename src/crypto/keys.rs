@@ -34,29 +34,6 @@ impl KeyPair {
             ),
         })
     }
-
-    /// Create from existing private key bytes (derives public key)
-    pub fn from_private_bytes(private_bytes: [u8; KEY_LEN]) -> Result<Self, CryptoError> {
-        // Use ring to derive public key from private
-        use ring::agreement::{EphemeralPrivateKey, X25519};
-
-        // For now, we'll store the private and generate a matching public
-        // In production, properly derive the public key
-        let builder = snow::Builder::new(super::NOISE_PATTERN.parse().unwrap());
-        let keypair = builder
-            .generate_keypair()
-            .map_err(|e| CryptoError::KeyGeneration(e.to_string()))?;
-
-        Ok(Self {
-            public: PublicKey(
-                keypair
-                    .public
-                    .try_into()
-                    .map_err(|_| CryptoError::InvalidKeyLength)?,
-            ),
-            private: PrivateKey(private_bytes),
-        })
-    }
 }
 
 /// X25519 public key
@@ -82,7 +59,7 @@ impl PublicKey {
     /// Encode as base64
     pub fn to_base64(&self) -> String {
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(&self.0)
+        base64::engine::general_purpose::STANDARD.encode(self.0)
     }
 
     /// Decode from base64
@@ -130,7 +107,7 @@ impl PrivateKey {
     /// Encode as base64 (be careful with this!)
     pub fn to_base64(&self) -> String {
         use base64::Engine;
-        base64::engine::general_purpose::STANDARD.encode(&self.0)
+        base64::engine::general_purpose::STANDARD.encode(self.0)
     }
 
     /// Decode from base64

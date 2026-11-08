@@ -1,19 +1,29 @@
 # Phantom Tunnel
 
-A secure, censorship-resistant tunneling protocol built in Rust.
+An encrypted, multiplexed TCP/UDP tunnel with a local SOCKS5 / HTTP proxy, built in Rust.
 
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 
 ## Features
 
-- **End-to-end encryption** using Noise Protocol (IK pattern) with ChaCha20-Poly1305
-- **TLS fingerprint mimicry** - Traffic looks like Chrome, Firefox, or Safari
-- **Stream multiplexing** with per-stream, credit-based flow control (one slow
-  connection no longer stalls the others)
-- **SOCKS5 (incl. UDP ASSOCIATE) & HTTP proxy** - TCP and UDP (DNS, QUIC, calls)
-- **DNS tunneling** - Fallback for heavily censored networks
-- **Traffic obfuscation** - Padding and timing randomization
+- **Encryption and mutual authentication** with the Noise Protocol (IK pattern,
+  X25519 + ChaCha20-Poly1305). The server only accepts allow-listed client keys.
+- **Stream multiplexing** over one connection, with per-stream credit-based flow
+  control (one slow connection does not stall the others)
+- **SOCKS5 (including UDP ASSOCIATE) and HTTP CONNECT** proxies on the client
+- **Automatic reconnect** and keepalive on the client
+- **Server hardening**: fail-closed allow-list, no logging of visited sites,
+  private/LAN destinations refused, handshake timeout
+
+### What it does not do
+
+The tunnel is **encrypted, not disguised**. On the wire it is length-prefixed
+Noise ciphertext over plain TCP — there is no TLS layer, no browser
+fingerprint mimicry, no padding or timing shaping, and no DNS transport. An
+observer cannot read the traffic, but traffic analysis can recognise that it is
+not ordinary HTTPS. Do not rely on it to hide the fact that you are using a
+tunnel.
 
 ### Protocol versions and compatibility
 
@@ -136,24 +146,23 @@ private_key = ""  # Auto-generated on first run
 public_key = ""   # Auto-generated on first run
 socks5_listen = "127.0.0.1:1080"
 http_listen = "127.0.0.1:8080"
-tls_profile = "chrome"  # chrome, firefox, safari, random
-enable_padding = true
 
 [logging]
 level = "info"
 ```
 
-## Building with Features
+## Building
 
 ```bash
-# Default (TLS, SOCKS5, HTTP proxy)
-cargo build --release
+cargo build --release              # target/release/phantom-server, phantom-client
+cargo build --profile release-small  # smaller binaries
+```
 
-# All features including DNS tunneling
-cargo build --release --all-features
+Cross-compiling the Windows client from Linux:
 
-# Minimal binary size
-cargo build --profile release-small
+```bash
+rustup target add x86_64-pc-windows-gnu   # plus the MinGW-w64 gcc package
+cargo build --release --bin phantom-client --target x86_64-pc-windows-gnu
 ```
 
 ## Documentation
@@ -164,40 +173,45 @@ cargo build --profile release-small
 ## Architecture
 
 ```
-┌─────────────────────────────────────────┐
-│         Application Layer               │
-│      (SOCKS5 / HTTP Proxy)              │
-├─────────────────────────────────────────┤
-│         Multiplexing Layer              │
-│    (Streams, Flow Control)              │
-├─────────────────────────────────────────┤
-│          Tunnel Layer                   │
-│   (Noise Protocol, Encryption)          │
-├─────────────────────────────────────────┤
-│        Obfuscation Layer                │
-│  (TLS Mimicry, Padding, Timing)         │
-├─────────────────────────────────────────┤
-│         Transport Layer                 │
-│     (TCP, TLS, DNS Tunnel)              │
-└─────────────────────────────────────────┘
+ app ── SOCKS5 / HTTP CONNECT ──┐                         ┌── destination
+                                │                         │
+                        phantom-client ══ TCP ══ phantom-server
+                                │                         │
+     streams + UDP associations, flow control (tunnel::Frame, StreamFlow)
+                Noise IK transport encryption (crypto)
+                 u16 length-prefixed ciphertext over TCP
 ```
+
+| Code | Contents |
+|---|---|
+| `src/bin/client.rs` | Client: local proxies, tunnel event loop, reconnect |
+| `src/bin/server.rs` | Server: handshake, allow-list, destination relay, UDP relay |
+| `src/crypto/` | Noise IK handshake and transport, X25519 key types |
+| `src/tunnel/` | Frame format, flow control, UDP address header |
+| `src/config/` | TOML configuration |
 
 ## Security
 
-- **Noise Protocol IK** - Forward secrecy, mutual authentication
-- **ChaCha20-Poly1305** - Fast, constant-time AEAD
-- **TLS 1.3** - Modern encryption with browser fingerprints
-- **No logging** - Privacy by design
+- **Noise Protocol IK** — forward secrecy and mutual authentication
+- **ChaCha20-Poly1305** — authenticated encryption of every frame
+- **Fail-closed allow-list** — an empty `allowed_clients` admits nobody
+- **No destination logging** — visited sites are logged only at `trace` level
+- **Not audited** — the cryptography and protocol have not had an independent review
 
 ## Testing
 
 ```bash
-# Run all tests
-cargo test
+cargo test                                  # unit, integration and end-to-end tests
+cargo clippy --all-targets -- -D warnings   # lints (kept clean)
+cargo bench --bench tunnel_bench            # frame / Noise / data-path benchmarks
 
-# Run with all features
-cargo test --all-features
+# End-to-end throughput through the real binaries (prints MB/s):
+cargo test --release --test e2e_proxy -- --ignored --nocapture throughput
 ```
+
+The end-to-end tests in `tests/e2e_proxy.rs` start the real `phantom-server`
+and `phantom-client` binaries and drive SOCKS5, HTTP CONNECT and UDP traffic
+through them.
 
 ## License
 

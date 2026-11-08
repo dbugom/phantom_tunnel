@@ -29,22 +29,6 @@ socks5_listen = "127.0.0.1:1080"
 # Set to empty string to disable HTTP proxy
 http_listen = "127.0.0.1:8080"
 
-# TLS Server Name Indication (SNI)
-# Appears in unencrypted TLS handshake
-# Use a popular CDN domain for camouflage in censored regions
-# Examples: "cdn.cloudflare.com", "ajax.googleapis.com", "cdn.jsdelivr.net"
-# tls_sni = "cdn.cloudflare.com"
-
-# TLS fingerprint profile to mimic
-# Helps avoid detection by mimicking real browser connections
-# Options: chrome, firefox, safari, edge, ios_safari, android_chrome, random
-tls_profile = "chrome"
-
-# Enable traffic padding
-# Adds random padding to obscure traffic patterns
-# Recommended for censored environments, disable for better performance
-enable_padding = true
-
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

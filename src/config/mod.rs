@@ -1,17 +1,17 @@
 //! Configuration management
 
-use crate::obfuscation::BrowserProfile;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Main configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     /// Server configuration
     pub server: Option<ServerConfig>,
     /// Client configuration
     pub client: Option<ClientConfig>,
-    /// Logging configuration
+    /// Logging configuration (optional; defaults to info/pretty)
+    #[serde(default)]
     pub logging: LoggingConfig,
 }
 
@@ -46,16 +46,6 @@ impl Config {
     }
 }
 
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: None,
-            client: None,
-            logging: LoggingConfig::default(),
-        }
-    }
-}
-
 /// Server configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerConfig {
@@ -69,12 +59,6 @@ pub struct ServerConfig {
     pub public_key: String,
     /// Allowed client public keys (base64)
     pub allowed_clients: Vec<String>,
-    /// TLS certificate path (for obfuscation)
-    pub tls_cert: Option<String>,
-    /// TLS key path
-    pub tls_key: Option<String>,
-    /// Decoy website to serve for invalid requests
-    pub decoy_site: Option<String>,
     /// Maximum concurrent connections
     pub max_connections: usize,
     /// Allow clients to reach private/loopback/link-local destinations through
@@ -91,9 +75,6 @@ impl Default for ServerConfig {
             private_key: String::new(),
             public_key: String::new(),
             allowed_clients: Vec::new(),
-            tls_cert: None,
-            tls_key: None,
-            decoy_site: None,
             max_connections: 1000,
             allow_private_destinations: false,
         }
@@ -117,12 +98,6 @@ pub struct ClientConfig {
     pub socks5_listen: Option<String>,
     /// Local HTTP proxy address
     pub http_listen: Option<String>,
-    /// TLS SNI to use (for camouflage)
-    pub tls_sni: Option<String>,
-    /// TLS fingerprint profile
-    pub tls_profile: String,
-    /// Enable padding
-    pub enable_padding: bool,
 }
 
 impl Default for ClientConfig {
@@ -134,31 +109,13 @@ impl Default for ClientConfig {
             public_key: String::new(),
             socks5_listen: Some("127.0.0.1:1080".to_string()),
             http_listen: Some("127.0.0.1:8080".to_string()),
-            tls_sni: None,
-            tls_profile: "chrome".to_string(),
-            enable_padding: true,
-        }
-    }
-}
-
-impl ClientConfig {
-    /// Get the browser profile from the tls_profile string
-    pub fn browser_profile(&self) -> BrowserProfile {
-        match self.tls_profile.to_lowercase().as_str() {
-            "chrome" => BrowserProfile::Chrome,
-            "firefox" => BrowserProfile::Firefox,
-            "safari" => BrowserProfile::Safari,
-            "edge" => BrowserProfile::Edge,
-            "random" => BrowserProfile::Random,
-            "ios" | "ios_safari" => BrowserProfile::IosSafari,
-            "android" | "android_chrome" => BrowserProfile::AndroidChrome,
-            _ => BrowserProfile::Chrome, // Default to Chrome
         }
     }
 }
 
 /// Logging configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggingConfig {
     /// Log level (trace, debug, info, warn, error)
     pub level: String,
@@ -184,5 +141,132 @@ pub fn generate_example_config() -> Config {
         server: Some(ServerConfig::default()),
         client: Some(ClientConfig::default()),
         logging: LoggingConfig::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+
+    /// The server config as deployed (v1 layout, comments, json logging) and
+    /// the v2 copy with labelled allow-list entries must keep loading.
+    #[test]
+    fn deployed_server_config_still_parses() {
+        let text = format!(
+            r#"[server]
+# NOT 443: this box's Caddy owns 443/tcp and LiveKit owns 443/udp (TURN).
+listen = "0.0.0.0:8444"
+public_key = "{k}"
+# Clients are allow-listed by public key. Empty list = nobody gets in.
+allowed_clients = [
+    "{k}",  # device1
+    "{k}",
+]
+max_connections = 100
+
+[logging]
+level = "info"
+format = "json"
+"#,
+            k = KEY
+        );
+        let cfg: Config = toml::from_str(&text).expect("server config must parse");
+        let s = cfg.server.unwrap();
+        assert_eq!(s.listen, "0.0.0.0:8444");
+        assert_eq!(s.allowed_clients.len(), 2);
+        assert!(!s.allow_private_destinations, "SSRF guard must default on");
+        assert_eq!(cfg.logging.format, "json");
+    }
+
+    /// Client configs written by earlier builds contain settings that no
+    /// longer exist (tls_profile, enable_padding, tls_sni). They must still
+    /// load, with those settings ignored.
+    #[test]
+    fn older_client_config_with_removed_settings_still_parses() {
+        let text = format!(
+            r#"[client]
+server = "46.225.110.152:8444"
+server_public_key = "{k}"
+private_key = "{k}"
+public_key = "{k}"
+socks5_listen = "127.0.0.1:1080"
+http_listen = "127.0.0.1:18080"
+tls_sni = "www.example.com"
+tls_profile = "chrome"
+enable_padding = true
+
+[logging]
+level = "info"
+format = "pretty"
+"#,
+            k = KEY
+        );
+        let cfg: Config = toml::from_str(&text).expect("old client config must parse");
+        let c = cfg.client.unwrap();
+        assert_eq!(c.server, "46.225.110.152:8444");
+        assert_eq!(c.http_listen.as_deref(), Some("127.0.0.1:18080"));
+    }
+
+    /// The blank template: empty keys, and no [logging] section at all.
+    #[test]
+    fn minimal_client_config_without_logging_parses() {
+        let text = format!(
+            r#"[client]
+server = "46.225.110.152:8444"
+server_public_key = "{k}"
+public_key = ""
+socks5_listen = "127.0.0.1:1080"
+"#,
+            k = KEY
+        );
+        let cfg: Config = toml::from_str(&text).expect("minimal config must parse");
+        let c = cfg.client.unwrap();
+        assert!(c.private_key.is_empty() && c.public_key.is_empty());
+        assert_eq!(c.http_listen, None);
+        assert_eq!(cfg.logging.level, "info");
+    }
+
+    /// The example configs shipped in the repository must load.
+    #[test]
+    fn shipped_example_configs_parse() {
+        for (name, text) in [
+            ("config.example.toml", include_str!("../../config.example.toml")),
+            ("examples/server.config.toml", include_str!("../../examples/server.config.toml")),
+            ("examples/client.config.toml", include_str!("../../examples/client.config.toml")),
+        ] {
+            let cfg: Config = toml::from_str(text).unwrap_or_else(|e| panic!("{}: {}", name, e));
+            assert!(cfg.server.is_some() || cfg.client.is_some(), "{} is empty", name);
+        }
+    }
+
+    /// Saving and re-loading keeps every setting.
+    #[test]
+    fn save_then_load_roundtrip() {
+        let dir = std::env::temp_dir().join(format!("pt-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let cfg = Config {
+            client: Some(ClientConfig {
+                server: "1.2.3.4:8444".into(),
+                server_public_key: KEY.into(),
+                private_key: KEY.into(),
+                public_key: KEY.into(),
+                ..ClientConfig::default()
+            }),
+            ..Config::default()
+        };
+        cfg.save(&path).unwrap();
+        let back = Config::load(&path).unwrap().client.unwrap();
+        assert_eq!(back.server, "1.2.3.4:8444");
+        assert_eq!(back.private_key, KEY);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "config holds a private key; must be owner-only");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -11,8 +11,10 @@ use clap::Parser;
 use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
-    obfuscation::BrowserProfile,
-    tunnel::{udp, Frame, FrameType, StreamFlow},
+    tunnel::{
+        udp, Frame, FrameType, StreamFlow, DEFAULT_WINDOW_SIZE, MAX_STREAMS, PROTOCOL_VERSION,
+        WINDOW_UPDATE_THRESHOLD,
+    },
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info};
 
 /// Phantom Tunnel Client - Secure, censorship-resistant tunnel
 #[derive(Parser, Debug)]
@@ -48,9 +50,10 @@ struct Args {
     #[arg(long)]
     http: Option<String>,
 
-    /// Browser profile for TLS fingerprint (chrome, firefox, safari, random)
-    #[arg(long, default_value = "chrome")]
-    profile: String,
+    /// Accepted for compatibility with older launch scripts; has no effect.
+    #[arg(long, hide = true)]
+    #[allow(dead_code)]
+    profile: Option<String>,
 
     /// Log level (trace, debug, info, warn, error)
     #[arg(short = 'v', long, default_value = "info")]
@@ -65,11 +68,6 @@ struct ClientState {
     server_public: PublicKey,
     /// Server address
     server_addr: String,
-    /// Browser profile
-    profile: BrowserProfile,
-    /// SNI for TLS (reserved for future TLS transport)
-    #[allow(dead_code)]
-    sni: String,
 }
 
 /// Request to open a new stream through the tunnel
@@ -221,30 +219,15 @@ async fn main() -> Result<()> {
         }
     };
 
-    // Parse browser profile
-    let profile = match args.profile.to_lowercase().as_str() {
-        "chrome" => BrowserProfile::Chrome,
-        "firefox" => BrowserProfile::Firefox,
-        "safari" => BrowserProfile::Safari,
-        "random" => BrowserProfile::Random,
-        _ => {
-            warn!("Unknown profile '{}', using Chrome", args.profile);
-            BrowserProfile::Chrome
-        }
-    };
-
     // Create client state
     let state = Arc::new(ClientState {
         keypair,
         server_public,
         server_addr: args.server.unwrap_or(client_config.server),
-        profile,
-        sni: client_config.tls_sni.unwrap_or_else(|| "www.google.com".to_string()),
     });
 
     info!("Phantom Tunnel Client v{}", phantom_tunnel::VERSION);
     info!("Server: {}", state.server_addr);
-    info!("Browser profile: {:?}", state.profile);
     info!("Client public key: {}...", &state.keypair.public.to_base64()[..16]);
 
     // Start local proxies
@@ -373,18 +356,12 @@ fn remove_stream(streams: &mut HashMap<u32, ActiveStream>, id: u32) {
     }
 }
 
-/// Maximum number of concurrently open streams per tunnel session.
-const MAX_CONCURRENT_STREAMS: usize = 1024;
 /// How often to send a keepalive ping.
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 /// Drop the tunnel (and reconnect) if nothing is received for this long.
 const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// Protocol version we speak. v2 adds flow control and UDP.
-const PROTOCOL_VERSION: u8 = 2;
-/// Initial per-stream send window (bytes), matching DEFAULT_WINDOW_SIZE.
-const INITIAL_WINDOW: i64 = 262144;
-/// Emit a WindowUpdate once this many delivered bytes have accumulated.
-const WINDOW_UPDATE_THRESHOLD: u32 = 131072;
+/// Initial per-stream send window as a signed credit count.
+const INITIAL_WINDOW: i64 = DEFAULT_WINDOW_SIZE as i64;
 
 /// Run the tunnel connection to server
 async fn run_tunnel(
@@ -584,7 +561,7 @@ async fn run_tunnel(
             Some(cmd) = cmd_rx.recv() => {
                 match cmd {
                     TunnelCommand::OpenStream(req) => {
-                        if active_streams.len() >= MAX_CONCURRENT_STREAMS {
+                        if active_streams.len() >= MAX_STREAMS {
                             let _ = req.response_tx.send(Err("Too many concurrent streams".to_string()));
                             continue;
                         }
@@ -618,7 +595,7 @@ async fn run_tunnel(
                         let _ = req.response_tx.send(Ok(conn));
                     }
                     TunnelCommand::OpenUdp { response_tx } => {
-                        if active_streams.len() >= MAX_CONCURRENT_STREAMS {
+                        if active_streams.len() >= MAX_STREAMS {
                             let _ = response_tx.send(Err("Too many concurrent streams".to_string()));
                             continue;
                         }
@@ -1070,7 +1047,7 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
     let mut request_line = String::new();
     reader.read_line(&mut request_line).await?;
 
-    let parts: Vec<&str> = request_line.trim().split_whitespace().collect();
+    let parts: Vec<&str> = request_line.split_whitespace().collect();
     if parts.len() < 3 || parts[0] != "CONNECT" {
         stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await?;
         return Err(anyhow!("Not a CONNECT request"));
