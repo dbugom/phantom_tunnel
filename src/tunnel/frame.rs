@@ -202,7 +202,10 @@ impl Frame {
 
     /// Decode frame from bytes
     pub fn decode(buf: &mut BytesMut) -> Result<Option<Self>, TunnelError> {
-        if buf.len() < FRAME_HEADER_SIZE {
+        // The on-wire header is 7 bytes: type(1) + stream_id(3) + payload_len(2)
+        // + padding_len(1). We must have all 7 before indexing buf[6] below,
+        // otherwise a short buffer would panic (fatal under panic=abort).
+        if buf.len() < FRAME_HEADER_SIZE + 1 {
             return Ok(None);
         }
 

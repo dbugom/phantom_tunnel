@@ -25,13 +25,24 @@ impl Config {
             .map_err(|e| crate::Error::Config(format!("Failed to parse config: {}", e)))
     }
 
-    /// Save configuration to file
+    /// Save configuration to file. The file holds the private key, so on Unix
+    /// it is written with 0600 permissions (owner read/write only).
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), crate::Error> {
         let content = toml::to_string_pretty(self)
             .map_err(|e| crate::Error::Config(format!("Failed to serialize config: {}", e)))?;
 
-        std::fs::write(path, content)
-            .map_err(|e| crate::Error::Config(format!("Failed to write config: {}", e)))
+        let path = path.as_ref();
+        std::fs::write(path, &content)
+            .map_err(|e| crate::Error::Config(format!("Failed to write config: {}", e)))?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Best-effort: don't fail the save if chmod isn't supported.
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+
+        Ok(())
     }
 }
 
@@ -66,6 +77,11 @@ pub struct ServerConfig {
     pub decoy_site: Option<String>,
     /// Maximum concurrent connections
     pub max_connections: usize,
+    /// Allow clients to reach private/loopback/link-local destinations through
+    /// the tunnel. Default false to prevent SSRF against the server's own
+    /// localhost, LAN, and cloud metadata endpoint (169.254.169.254).
+    #[serde(default)]
+    pub allow_private_destinations: bool,
 }
 
 impl Default for ServerConfig {
@@ -79,6 +95,7 @@ impl Default for ServerConfig {
             tls_key: None,
             decoy_site: None,
             max_connections: 1000,
+            allow_private_destinations: false,
         }
     }
 }
