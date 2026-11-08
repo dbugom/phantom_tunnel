@@ -197,6 +197,10 @@ impl Multiplexer {
                 // Ignore padding frames
                 Ok(None)
             }
+            FrameType::UdpAssociate | FrameType::UdpData => {
+                // UDP is handled directly by the binaries, not this multiplexer.
+                Ok(None)
+            }
         }
     }
 

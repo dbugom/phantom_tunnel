@@ -12,12 +12,12 @@ use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
     obfuscation::BrowserProfile,
-    tunnel::{Frame, FrameType},
+    tunnel::{udp, Frame, FrameType, StreamFlow},
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
@@ -86,6 +86,11 @@ struct OpenStreamRequest {
 struct StreamConnection {
     stream_id: u32,
     data_rx: mpsc::Receiver<bytes::Bytes>,
+    /// Send-side credit window for this stream (granted by the server's
+    /// WindowUpdate frames). The uploader task acquires credit before sending.
+    flow: Arc<StreamFlow>,
+    /// Whether flow control is active (both ends are v2).
+    flow_enabled: bool,
 }
 
 /// Tunnel command sent from proxy handlers to tunnel task
@@ -94,8 +99,24 @@ enum TunnelCommand {
     OpenStream(OpenStreamRequest),
     /// Send data on a stream
     SendData { stream_id: u32, data: bytes::Bytes },
+    /// Report bytes drained to the local socket, so the tunnel can send a
+    /// WindowUpdate replenishing the peer's send window.
+    StreamConsumed { stream_id: u32, bytes: u32 },
     /// Close a stream
     CloseStream { stream_id: u32 },
+    /// Open a UDP association; replies with the allocated stream id.
+    OpenUdp {
+        response_tx: oneshot::Sender<Result<UdpSession, String>>,
+    },
+    /// Send one datagram (ATYP|ADDR|PORT|data) on a UDP association.
+    SendUdp { stream_id: u32, payload: bytes::Bytes },
+}
+
+/// Handle to a UDP association through the tunnel.
+struct UdpSession {
+    stream_id: u32,
+    /// Inbound datagrams from the tunnel (each ATYP|ADDR|PORT|data).
+    rx: mpsc::Receiver<bytes::Bytes>,
 }
 
 /// Shared tunnel handle for proxy handlers
@@ -116,6 +137,16 @@ impl TunnelHandle {
             .await
             .map_err(|_| "Tunnel disconnected".to_string())?;
 
+        response_rx.await.map_err(|_| "Tunnel closed".to_string())?
+    }
+
+    /// Open a UDP association through the tunnel.
+    async fn open_udp(&self) -> Result<UdpSession, String> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.cmd_tx
+            .send(TunnelCommand::OpenUdp { response_tx })
+            .await
+            .map_err(|_| "Tunnel disconnected".to_string())?;
         response_rx.await.map_err(|_| "Tunnel closed".to_string())?
     }
 }
@@ -317,7 +348,12 @@ fn generate_keypair() -> Result<()> {
 
 /// Active stream state in the tunnel
 struct ActiveStream {
+    /// Forwards inbound payloads to the local consumer task.
     data_tx: mpsc::Sender<bytes::Bytes>,
+    /// Send-side credit window (shared with the uploader task).
+    flow: Arc<StreamFlow>,
+    /// Bytes delivered to the consumer since the last WindowUpdate we sent.
+    delivered: u32,
 }
 
 /// Message from the reader task
@@ -330,12 +366,25 @@ enum ReaderMessage {
     Closed,
 }
 
+/// Remove a stream and release any uploader task blocked on its send window.
+fn remove_stream(streams: &mut HashMap<u32, ActiveStream>, id: u32) {
+    if let Some(s) = streams.remove(&id) {
+        s.flow.close();
+    }
+}
+
 /// Maximum number of concurrently open streams per tunnel session.
 const MAX_CONCURRENT_STREAMS: usize = 1024;
 /// How often to send a keepalive ping.
 const KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(20);
 /// Drop the tunnel (and reconnect) if nothing is received for this long.
 const PEER_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Protocol version we speak. v2 adds flow control and UDP.
+const PROTOCOL_VERSION: u8 = 2;
+/// Initial per-stream send window (bytes), matching DEFAULT_WINDOW_SIZE.
+const INITIAL_WINDOW: i64 = 262144;
+/// Emit a WindowUpdate once this many delivered bytes have accumulated.
+const WINDOW_UPDATE_THRESHOLD: u32 = 131072;
 
 /// Run the tunnel connection to server
 async fn run_tunnel(
@@ -355,15 +404,22 @@ async fn run_tunnel(
     let (mut read_half, mut write_half) = stream.into_split();
 
     // Perform Noise handshake using both halves
-    let mut noise_transport = match perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &state.server_public).await {
-        Ok(transport) => transport,
+    let (mut noise_transport, peer_version) = match perform_handshake_split(&mut read_half, &mut write_half, &state.keypair, &state.server_public).await {
+        Ok(result) => result,
         Err(e) => {
             error!("Handshake failed: {:?}", e);
             return Err(e.context("Handshake failed"));
         }
     };
 
-    info!("Handshake complete, tunnel established");
+    // Flow control and UDP require a v2 server. Against a v1 server we fall back
+    // to the previous behaviour (no flow control, blocking forward).
+    let flow_enabled = peer_version >= 2;
+    info!(
+        "Handshake complete, tunnel established (server protocol v{}, flow control {})",
+        peer_version,
+        if flow_enabled { "on" } else { "off" }
+    );
 
     // Create channel for reader task to send frames to main loop
     let (reader_tx, mut reader_rx) = mpsc::channel::<ReaderMessage>(256);
@@ -449,17 +505,53 @@ async fn run_tunnel(
                             match frame.frame_type {
                                 FrameType::Data => {
                                     if let Some(active) = active_streams.get(&frame.stream_id) {
-                                        // Backpressure on a single slow destination
-                                        // only affects that stream's consumer task.
-                                        if active.data_tx.send(frame.payload).await.is_err() {
-                                            active_streams.remove(&frame.stream_id);
+                                        if flow_enabled {
+                                            // Peer respects our window, so the bounded
+                                            // channel can't overflow under correct
+                                            // behaviour; `Full` means a violation.
+                                            match active.data_tx.try_send(frame.payload) {
+                                                Ok(()) => {}
+                                                Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                    remove_stream(&mut active_streams, frame.stream_id);
+                                                }
+                                                Err(mpsc::error::TrySendError::Full(_)) => {
+                                                    debug!("Stream {} exceeded window; resetting", frame.stream_id);
+                                                    remove_stream(&mut active_streams, frame.stream_id);
+                                                    let f = Frame::stream_close(frame.stream_id);
+                                                    send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
+                                                }
+                                            }
+                                        } else {
+                                            // v1 server: no flow control, block-forward.
+                                            if active.data_tx.send(frame.payload).await.is_err() {
+                                                remove_stream(&mut active_streams, frame.stream_id);
+                                            }
+                                        }
+                                    }
+                                }
+                                FrameType::UdpData => {
+                                    // Deliver datagram to the UDP session; drop oldest
+                                    // under pressure (datagram semantics allow loss).
+                                    if let Some(active) = active_streams.get(&frame.stream_id) {
+                                        if active.data_tx.try_send(frame.payload).is_err() {
+                                            // channel full or closed: drop this datagram
+                                        }
+                                    }
+                                }
+                                FrameType::WindowUpdate => {
+                                    if flow_enabled {
+                                        if let Some(active) = active_streams.get(&frame.stream_id) {
+                                            if frame.payload.len() >= 4 {
+                                                let inc = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+                                                active.flow.add(inc as i64);
+                                            }
                                         }
                                     }
                                 }
                                 FrameType::StreamClose => {
                                     // Server closed its side; drop the sender so the
                                     // consumer finishes and the socket closes.
-                                    active_streams.remove(&frame.stream_id);
+                                    remove_stream(&mut active_streams, frame.stream_id);
                                 }
                                 FrameType::Ping => {
                                     // Reply so the server can measure our liveness.
@@ -468,11 +560,11 @@ async fn run_tunnel(
                                     } else { 0 };
                                     send_frame_write(&mut write_half, &mut noise_transport, &Frame::pong(data)).await?;
                                 }
-                                FrameType::Pong | FrameType::Padding | FrameType::WindowUpdate => {}
+                                FrameType::Pong | FrameType::Padding => {}
                                 FrameType::GoAway => {
                                     return Err(anyhow::anyhow!("Server sent GoAway"));
                                 }
-                                FrameType::StreamOpen => {
+                                FrameType::StreamOpen | FrameType::UdpAssociate => {
                                     // Server never opens streams to the client.
                                 }
                             }
@@ -515,10 +607,42 @@ async fn run_tunnel(
                         }
 
                         let (data_tx, data_rx) = mpsc::channel(256);
-                        active_streams.insert(stream_id, ActiveStream { data_tx });
+                        let flow = Arc::new(StreamFlow::new(INITIAL_WINDOW));
+                        active_streams.insert(stream_id, ActiveStream {
+                            data_tx,
+                            flow: Arc::clone(&flow),
+                            delivered: 0,
+                        });
 
-                        let conn = StreamConnection { stream_id, data_rx };
+                        let conn = StreamConnection { stream_id, data_rx, flow, flow_enabled };
                         let _ = req.response_tx.send(Ok(conn));
+                    }
+                    TunnelCommand::OpenUdp { response_tx } => {
+                        if active_streams.len() >= MAX_CONCURRENT_STREAMS {
+                            let _ = response_tx.send(Err("Too many concurrent streams".to_string()));
+                            continue;
+                        }
+                        let mut stream_id = next_stream_id;
+                        while active_streams.contains_key(&stream_id) {
+                            stream_id = stream_id.wrapping_add(2);
+                            if stream_id == 0 { stream_id = 1; }
+                        }
+                        next_stream_id = stream_id.wrapping_add(2);
+                        if next_stream_id == 0 { next_stream_id = 1; }
+
+                        let open = Frame::udp_associate(stream_id);
+                        if let Err(e) = send_frame_write(&mut write_half, &mut noise_transport, &open).await {
+                            let _ = response_tx.send(Err(format!("Failed to open UDP: {}", e)));
+                            return Err(e);
+                        }
+                        // Larger buffer: datagrams can burst.
+                        let (data_tx, rx) = mpsc::channel(1024);
+                        active_streams.insert(stream_id, ActiveStream {
+                            data_tx,
+                            flow: Arc::new(StreamFlow::new(INITIAL_WINDOW)),
+                            delivered: 0,
+                        });
+                        let _ = response_tx.send(Ok(UdpSession { stream_id, rx }));
                     }
                     TunnelCommand::SendData { stream_id, data } => {
                         // Drop data for a stream we've already torn down.
@@ -527,8 +651,27 @@ async fn run_tunnel(
                             send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
                         }
                     }
+                    TunnelCommand::SendUdp { stream_id, payload } => {
+                        if active_streams.contains_key(&stream_id) {
+                            let frame = Frame::udp_data(stream_id, payload);
+                            send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+                        }
+                    }
+                    TunnelCommand::StreamConsumed { stream_id, bytes } => {
+                        if flow_enabled {
+                            if let Some(active) = active_streams.get_mut(&stream_id) {
+                                active.delivered = active.delivered.saturating_add(bytes);
+                                if active.delivered >= WINDOW_UPDATE_THRESHOLD {
+                                    let inc = active.delivered;
+                                    active.delivered = 0;
+                                    let f = Frame::window_update(stream_id, inc);
+                                    send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
+                                }
+                            }
+                        }
+                    }
                     TunnelCommand::CloseStream { stream_id } => {
-                        if active_streams.remove(&stream_id).is_some() {
+                        if active_streams.remove(&stream_id).map(|s| s.flow.close()).is_some() {
                             let frame = Frame::stream_close(stream_id);
                             send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
                         }
@@ -550,22 +693,25 @@ async fn run_tunnel(
     Ok(())
 }
 
-/// Perform Noise IK handshake with split streams
+/// Perform Noise IK handshake with split streams.
+/// Returns the transport and the peer's negotiated protocol version (0 if the
+/// server is a v1 build that sent no version byte).
 async fn perform_handshake_split(
     read_half: &mut OwnedReadHalf,
     write_half: &mut OwnedWriteHalf,
     keypair: &KeyPair,
     server_public: &PublicKey,
-) -> Result<NoiseTransport> {
+) -> Result<(NoiseTransport, u8)> {
     let mut handshake = NoiseHandshake::new_initiator(keypair, server_public)
         .context("Failed to create handshake")?;
 
     let mut buf = [0u8; 65535];
     let mut payload_buf = [0u8; 65535];
 
-    // Send first message (-> e, es, s, ss)
+    // Send first message (-> e, es, s, ss) carrying our protocol version as the
+    // Noise payload. A v1 server ignores unknown payload bytes.
     let len = handshake
-        .write_message(&[], &mut buf)
+        .write_message(&[PROTOCOL_VERSION], &mut buf)
         .context("Failed to write handshake message 1")?;
 
     let len_bytes = (len as u16).to_be_bytes();
@@ -579,16 +725,19 @@ async fn perform_handshake_split(
 
     read_half.read_exact(&mut buf[..msg_len]).await?;
 
-    handshake
+    let payload_len = handshake
         .read_message(&buf[..msg_len], &mut payload_buf)
         .context("Failed to read handshake message 2")?;
+
+    // The server echoes its own version as the response payload; absent on v1.
+    let peer_version = if payload_len >= 1 { payload_buf[0] } else { 0 };
 
     // Convert to transport mode
     let noise_transport = handshake
         .into_transport()
         .context("Failed to enter transport mode")?;
 
-    Ok(noise_transport)
+    Ok((noise_transport, peer_version))
 }
 
 /// Send an encrypted frame using write half.
@@ -612,6 +761,74 @@ async fn send_frame_write(
     write_half.write_all(&out).await?;
 
     Ok(())
+}
+
+/// Relay a local TCP connection over an opened tunnel stream, in both
+/// directions, applying send-side flow control when enabled. Shared by the
+/// SOCKS5 and HTTP CONNECT handlers.
+async fn relay_stream(
+    mut conn: StreamConnection,
+    mut client_read: OwnedReadHalf,
+    mut client_write: OwnedWriteHalf,
+    tunnel: Arc<TunnelHandle>,
+) {
+    let stream_id = conn.stream_id;
+    let flow_enabled = conn.flow_enabled;
+    let flow = Arc::clone(&conn.flow);
+    let up = Arc::clone(&tunnel);
+
+    // Uploader: local app -> tunnel. Read first, then send in credit-sized
+    // chunks so one stream's backpressure never blocks the tunnel loop.
+    let client_to_tunnel = tokio::spawn(async move {
+        let mut buf = vec![0u8; 32768];
+        'outer: loop {
+            let n = match client_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            if flow_enabled {
+                let mut sent = 0;
+                while sent < n {
+                    let got = flow.acquire(n - sent).await;
+                    if got == 0 {
+                        break 'outer; // stream closed
+                    }
+                    let chunk = bytes::Bytes::copy_from_slice(&buf[sent..sent + got]);
+                    if up.cmd_tx.send(TunnelCommand::SendData { stream_id, data: chunk }).await.is_err() {
+                        break 'outer;
+                    }
+                    sent += got;
+                }
+            } else {
+                let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                if up.cmd_tx.send(TunnelCommand::SendData { stream_id, data }).await.is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = up.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
+    });
+
+    // Downloader: tunnel -> local app. Report bytes drained so the tunnel can
+    // replenish the peer's send window.
+    let down = Arc::clone(&tunnel);
+    let tunnel_to_client = tokio::spawn(async move {
+        while let Some(data) = conn.data_rx.recv().await {
+            let n = data.len();
+            if client_write.write_all(&data).await.is_err() {
+                break;
+            }
+            if flow_enabled && n > 0 {
+                let _ = down.cmd_tx.send(TunnelCommand::StreamConsumed { stream_id, bytes: n as u32 }).await;
+            }
+        }
+    });
+
+    tokio::select! {
+        _ = client_to_tunnel => {}
+        _ = tunnel_to_client => {}
+    }
 }
 
 /// Run local SOCKS5 proxy
@@ -657,8 +874,14 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
     let cmd = buf[1];
     let addr_type = buf[3];
 
+    // UDP ASSOCIATE (0x03) is handled separately; it still reads the (ignored)
+    // address/port that follow in the request.
+    if cmd == 0x03 {
+        return handle_udp_associate(stream, addr_type, tunnel).await;
+    }
+
     if cmd != 0x01 {
-        // Only support CONNECT
+        // Only CONNECT and UDP ASSOCIATE are supported.
         stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
         return Err(anyhow!("Unsupported command: {}", cmd));
     }
@@ -705,62 +928,121 @@ async fn handle_socks5_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandl
 
     // Open stream through tunnel
     match tunnel.open_stream(destination.clone()).await {
-        Ok(mut conn) => {
-            info!("Tunnel stream {} opened to {}", conn.stream_id, destination);
+        Ok(conn) => {
+            debug!("Tunnel stream {} opened", conn.stream_id);
 
             // Send success
             stream.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
 
-            // Relay data bidirectionally
-            let (mut client_read, mut client_write) = stream.into_split();
-            let stream_id = conn.stream_id;
-            let tunnel_clone = Arc::clone(&tunnel);
-
-            // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 32768];
-                loop {
-                    match client_read.read(&mut buf).await {
-                        Ok(0) => break, // EOF
-                        Ok(n) => {
-                            let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                            if tunnel_clone.cmd_tx.send(TunnelCommand::SendData {
-                                stream_id,
-                                data,
-                            }).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                // Close the stream when client disconnects
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
-            });
-
-            // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
-                while let Some(data) = conn.data_rx.recv().await {
-                    if client_write.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            // Wait for either direction to complete
-            tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
-            }
+            let (client_read, client_write) = stream.into_split();
+            relay_stream(conn, client_read, client_write, tunnel).await;
         }
         Err(e) => {
-            error!("Failed to open tunnel stream to {}: {}", destination, e);
+            debug!("Failed to open tunnel stream: {}", e);
             // Send failure (host unreachable)
             stream.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
         }
     }
 
     Ok(())
+}
+
+/// Handle a SOCKS5 UDP ASSOCIATE request. Binds a local UDP socket, replies with
+/// its address, opens a UDP association through the tunnel, and relays datagrams
+/// until the TCP control connection closes (per RFC 1928).
+async fn handle_udp_associate(
+    mut stream: TcpStream,
+    addr_type: u8,
+    tunnel: Arc<TunnelHandle>,
+) -> Result<()> {
+    // Consume the client's (ignored) DST.ADDR / DST.PORT from the request.
+    let mut scratch = [0u8; 256];
+    match addr_type {
+        0x01 => { stream.read_exact(&mut scratch[..4 + 2]).await?; }
+        0x04 => { stream.read_exact(&mut scratch[..16 + 2]).await?; }
+        0x03 => {
+            stream.read_exact(&mut scratch[..1]).await?;
+            let len = scratch[0] as usize;
+            stream.read_exact(&mut scratch[..len + 2]).await?;
+        }
+        _ => {
+            stream.write_all(&[0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+            return Err(anyhow!("Unsupported address type: {}", addr_type));
+        }
+    }
+
+    // Bind the local UDP relay socket on the same interface as the control conn.
+    let local_ip = stream.local_addr()?.ip();
+    let udp = Arc::new(UdpSocket::bind((local_ip, 0)).await?);
+    let bound = udp.local_addr()?;
+
+    // Open the UDP association through the tunnel.
+    let session = tunnel.open_udp().await.map_err(|e| anyhow!(e))?;
+    let stream_id = session.stream_id;
+    let mut rx = session.rx;
+
+    // Reply: succeeded, with the UDP bind address for the app to send to.
+    let mut reply = vec![0x05, 0x00, 0x00];
+    let mut hdr = bytes::BytesMut::new();
+    udp_encode_socketaddr(&mut hdr, bound);
+    reply.extend_from_slice(&hdr);
+    stream.write_all(&reply).await?;
+
+    // The app's source address (learned from its first datagram).
+    let peer: Arc<tokio::sync::Mutex<Option<std::net::SocketAddr>>> =
+        Arc::new(tokio::sync::Mutex::new(None));
+
+    // App -> tunnel: strip the 3-byte SOCKS UDP header, forward ATYP|ADDR|PORT|data.
+    let up_udp = Arc::clone(&udp);
+    let up_peer = Arc::clone(&peer);
+    let up_tunnel = Arc::clone(&tunnel);
+    let app_to_tunnel = tokio::spawn(async move {
+        let mut dbuf = vec![0u8; 65535];
+        loop {
+            let (n, src) = match up_udp.recv_from(&mut dbuf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            *up_peer.lock().await = Some(src);
+            // SOCKS5 UDP request header: RSV(2) FRAG(1) then ATYP|ADDR|PORT|data.
+            if n < 3 || dbuf[2] != 0x00 {
+                continue; // too short or fragmented (FRAG != 0): drop
+            }
+            let payload = bytes::Bytes::copy_from_slice(&dbuf[3..n]);
+            if up_tunnel.cmd_tx.send(TunnelCommand::SendUdp { stream_id, payload }).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // tunnel -> app: wrap each datagram in the SOCKS5 UDP response header.
+    let down_udp = Arc::clone(&udp);
+    let down_peer = Arc::clone(&peer);
+    let tunnel_to_app = tokio::spawn(async move {
+        while let Some(payload) = rx.recv().await {
+            let dst = { *down_peer.lock().await };
+            if let Some(dst) = dst {
+                let mut out = Vec::with_capacity(3 + payload.len());
+                out.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV, FRAG=0
+                out.extend_from_slice(&payload); // already ATYP|ADDR|PORT|data
+                let _ = down_udp.send_to(&out, dst).await;
+            }
+        }
+    });
+
+    // The association lives as long as the TCP control connection. When it
+    // closes (read returns), tear everything down.
+    let mut ctrl = [0u8; 256];
+    let _ = stream.read(&mut ctrl).await;
+    app_to_tunnel.abort();
+    tunnel_to_app.abort();
+    let _ = tunnel.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
+    Ok(())
+}
+
+/// Encode a SocketAddr as SOCKS5 ATYP|ADDR|PORT into `buf`.
+fn udp_encode_socketaddr(buf: &mut bytes::BytesMut, addr: std::net::SocketAddr) {
+    udp::encode_ip(buf, addr);
 }
 
 /// Run local HTTP proxy
@@ -809,54 +1091,17 @@ async fn handle_http_connection(mut stream: TcpStream, tunnel: Arc<TunnelHandle>
 
     // Open stream through tunnel
     match tunnel.open_stream(destination.clone()).await {
-        Ok(mut conn) => {
-            info!("Tunnel stream {} opened to {}", conn.stream_id, destination);
+        Ok(conn) => {
+            debug!("Tunnel stream {} opened", conn.stream_id);
 
             // Send success
             stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-            // Relay data bidirectionally
-            let (mut client_read, mut client_write) = stream.into_split();
-            let stream_id = conn.stream_id;
-            let tunnel_clone = Arc::clone(&tunnel);
-
-            // Task to read from client and send to tunnel
-            let client_to_tunnel = tokio::spawn(async move {
-                let mut buf = vec![0u8; 32768];
-                loop {
-                    match client_read.read(&mut buf).await {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                            if tunnel_clone.cmd_tx.send(TunnelCommand::SendData {
-                                stream_id,
-                                data,
-                            }).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                let _ = tunnel_clone.cmd_tx.send(TunnelCommand::CloseStream { stream_id }).await;
-            });
-
-            // Task to read from tunnel and send to client
-            let tunnel_to_client = tokio::spawn(async move {
-                while let Some(data) = conn.data_rx.recv().await {
-                    if client_write.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-            });
-
-            tokio::select! {
-                _ = client_to_tunnel => {}
-                _ = tunnel_to_client => {}
-            }
+            let (client_read, client_write) = stream.into_split();
+            relay_stream(conn, client_read, client_write, tunnel).await;
         }
         Err(e) => {
-            error!("Failed to open tunnel stream to {}: {}", destination, e);
+            debug!("Failed to open tunnel stream: {}", e);
             stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
         }
     }

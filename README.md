@@ -9,10 +9,18 @@ A secure, censorship-resistant tunneling protocol built in Rust.
 
 - **End-to-end encryption** using Noise Protocol (IK pattern) with ChaCha20-Poly1305
 - **TLS fingerprint mimicry** - Traffic looks like Chrome, Firefox, or Safari
-- **Stream multiplexing** - Multiple connections over a single tunnel
-- **SOCKS5 & HTTP proxy** - Works with any application
+- **Stream multiplexing** with per-stream, credit-based flow control (one slow
+  connection no longer stalls the others)
+- **SOCKS5 (incl. UDP ASSOCIATE) & HTTP proxy** - TCP and UDP (DNS, QUIC, calls)
 - **DNS tunneling** - Fallback for heavily censored networks
 - **Traffic obfuscation** - Padding and timing randomization
+
+### Protocol versions and compatibility
+
+The client and server negotiate a protocol version during the Noise handshake.
+Flow control and UDP require **both** ends to be v2 (this build). A v2 build still
+interoperates with an older v1 build (TCP CONNECT only, no flow control), so you
+can upgrade the server and clients independently.
 
 ## Quick Start
 

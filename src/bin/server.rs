@@ -11,12 +11,12 @@ use clap::Parser;
 use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
-    tunnel::{Frame, FrameType},
+    tunnel::{udp, Frame, FrameType, StreamFlow},
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, trace, warn};
@@ -60,14 +60,36 @@ struct ServerState {
 enum StreamToTunnel {
     /// Data to send on a stream
     Data { stream_id: u32, data: bytes::Bytes },
+    /// Bytes drained to the destination; triggers a WindowUpdate to the client.
+    Consumed { stream_id: u32, bytes: u32 },
     /// Stream closed
     Close { stream_id: u32 },
+    /// A UDP datagram to send back to the client (ATYP|ADDR|PORT|data).
+    Udp { stream_id: u32, payload: bytes::Bytes },
 }
 
 /// Active stream with channel to send data to it
 struct ActiveStream {
     data_tx: mpsc::Sender<bytes::Bytes>,
+    /// Send-side credit window (server -> client direction).
+    flow: Arc<StreamFlow>,
+    /// Bytes delivered to the destination since the last WindowUpdate sent.
+    delivered: u32,
 }
+
+/// Remove a stream and release any sender task blocked on its send window.
+fn remove_stream(streams: &mut HashMap<u32, ActiveStream>, id: u32) {
+    if let Some(s) = streams.remove(&id) {
+        s.flow.close();
+    }
+}
+
+/// Protocol version the server speaks. v2 adds flow control and UDP.
+const PROTOCOL_VERSION: u8 = 2;
+/// Initial per-stream send window (bytes).
+const INITIAL_WINDOW: i64 = 262144;
+/// Emit a WindowUpdate once this many delivered bytes have accumulated.
+const WINDOW_UPDATE_THRESHOLD: u32 = 131072;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -244,12 +266,15 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
 
     // Perform Noise handshake with a timeout so a client that connects but never
     // completes the handshake can't hold a connection permit indefinitely.
-    let (mut noise_transport, client_public) = tokio::time::timeout(
+    let (mut noise_transport, client_public, client_version) = tokio::time::timeout(
         std::time::Duration::from_secs(10),
         perform_handshake_split(&mut read_half, &mut write_half, &state.keypair),
     )
     .await
     .map_err(|_| anyhow!("Handshake timed out"))??;
+
+    // Flow control and UDP only engage when the client is also v2.
+    let flow_enabled = client_version >= 2;
 
     // Verify client is allowed. Fail CLOSED: an empty allowlist rejects every
     // client (matching the warning printed at startup). Previously an empty
@@ -365,26 +390,78 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                                 trace!("Opening stream {}", stream_id);
 
                                 let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(256);
-                                active_streams.insert(stream_id, ActiveStream { data_tx });
+                                let flow = Arc::new(StreamFlow::new(INITIAL_WINDOW));
+                                active_streams.insert(stream_id, ActiveStream {
+                                    data_tx,
+                                    flow: Arc::clone(&flow),
+                                    delivered: 0,
+                                });
 
                                 let tunnel_tx = tunnel_tx.clone();
                                 let allow_private = state.allow_private_destinations;
                                 tokio::spawn(async move {
-                                    if let Err(e) = handle_stream(stream_id, destination, data_rx, tunnel_tx, allow_private).await {
+                                    if let Err(e) = handle_stream(stream_id, destination, data_rx, tunnel_tx, allow_private, flow, flow_enabled).await {
                                         debug!("Stream {} error: {}", stream_id, e);
+                                    }
+                                });
+                            }
+                            FrameType::UdpAssociate => {
+                                let stream_id = frame.stream_id;
+                                trace!("Opening UDP association {}", stream_id);
+                                let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(1024);
+                                active_streams.insert(stream_id, ActiveStream {
+                                    data_tx,
+                                    flow: Arc::new(StreamFlow::new(INITIAL_WINDOW)),
+                                    delivered: 0,
+                                });
+                                let tunnel_tx = tunnel_tx.clone();
+                                let allow_private = state.allow_private_destinations;
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_udp(stream_id, data_rx, tunnel_tx, allow_private).await {
+                                        debug!("UDP {} error: {}", stream_id, e);
                                     }
                                 });
                             }
                             FrameType::Data => {
                                 let stream_id = frame.stream_id;
                                 if let Some(active) = active_streams.get(&stream_id) {
-                                    if active.data_tx.send(frame.payload).await.is_err() {
-                                        active_streams.remove(&stream_id);
+                                    if flow_enabled {
+                                        match active.data_tx.try_send(frame.payload) {
+                                            Ok(()) => {}
+                                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                                remove_stream(&mut active_streams, stream_id);
+                                            }
+                                            Err(mpsc::error::TrySendError::Full(_)) => {
+                                                debug!("Stream {} exceeded window; resetting", stream_id);
+                                                remove_stream(&mut active_streams, stream_id);
+                                                let f = Frame::stream_close(stream_id);
+                                                send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
+                                            }
+                                        }
+                                    } else if active.data_tx.send(frame.payload).await.is_err() {
+                                        remove_stream(&mut active_streams, stream_id);
+                                    }
+                                }
+                            }
+                            FrameType::UdpData => {
+                                let stream_id = frame.stream_id;
+                                if let Some(active) = active_streams.get(&stream_id) {
+                                    // Drop datagram under pressure (lossy by nature).
+                                    let _ = active.data_tx.try_send(frame.payload);
+                                }
+                            }
+                            FrameType::WindowUpdate => {
+                                if flow_enabled {
+                                    if let Some(active) = active_streams.get(&frame.stream_id) {
+                                        if frame.payload.len() >= 4 {
+                                            let inc = u32::from_be_bytes(frame.payload[..4].try_into().unwrap());
+                                            active.flow.add(inc as i64);
+                                        }
                                     }
                                 }
                             }
                             FrameType::StreamClose => {
-                                active_streams.remove(&frame.stream_id);
+                                remove_stream(&mut active_streams, frame.stream_id);
                             }
                             FrameType::Ping => {
                                 let data = if frame.payload.len() >= 8 {
@@ -392,7 +469,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                                 } else { 0 };
                                 send_frame_write(&mut write_half, &mut noise_transport, &Frame::pong(data)).await?;
                             }
-                            FrameType::Pong | FrameType::Padding | FrameType::WindowUpdate => {}
+                            FrameType::Pong | FrameType::Padding => {}
                             FrameType::GoAway => {
                                 break;
                             }
@@ -416,8 +493,25 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                         let frame = Frame::data(stream_id, data);
                         send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
                     }
+                    StreamToTunnel::Udp { stream_id, payload } => {
+                        let frame = Frame::udp_data(stream_id, payload);
+                        send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
+                    }
+                    StreamToTunnel::Consumed { stream_id, bytes } => {
+                        if flow_enabled {
+                            if let Some(active) = active_streams.get_mut(&stream_id) {
+                                active.delivered = active.delivered.saturating_add(bytes);
+                                if active.delivered >= WINDOW_UPDATE_THRESHOLD {
+                                    let inc = active.delivered;
+                                    active.delivered = 0;
+                                    let f = Frame::window_update(stream_id, inc);
+                                    send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
+                                }
+                            }
+                        }
+                    }
                     StreamToTunnel::Close { stream_id } => {
-                        active_streams.remove(&stream_id);
+                        remove_stream(&mut active_streams, stream_id);
                         let frame = Frame::stream_close(stream_id);
                         send_frame_write(&mut write_half, &mut noise_transport, &frame).await?;
                     }
@@ -454,12 +548,14 @@ fn parse_destination(payload: &[u8]) -> Option<String> {
     Some(s.to_string())
 }
 
-/// Perform Noise IK handshake with split streams
+/// Perform Noise IK handshake with split streams.
+/// Returns the transport, the client's static public key, and the client's
+/// protocol version (0 if the client is a v1 build that sent no version byte).
 async fn perform_handshake_split(
     read_half: &mut OwnedReadHalf,
     write_half: &mut OwnedWriteHalf,
     keypair: &KeyPair,
-) -> Result<(NoiseTransport, PublicKey)> {
+) -> Result<(NoiseTransport, PublicKey, u8)> {
     let mut handshake = NoiseHandshake::new_responder(keypair)
         .context("Failed to create handshake")?;
 
@@ -473,18 +569,21 @@ async fn perform_handshake_split(
 
     read_half.read_exact(&mut buf[..msg_len]).await?;
 
-    handshake
+    let payload_len = handshake
         .read_message(&buf[..msg_len], &mut payload_buf)
         .context("Failed to read handshake message 1")?;
+
+    // The client's protocol version is the first payload byte, if present.
+    let client_version = if payload_len >= 1 { payload_buf[0] } else { 0 };
 
     // Get client's public key
     let client_public = handshake
         .get_remote_static()
         .ok_or_else(|| anyhow!("Failed to get client public key"))?;
 
-    // Send response (<- e, ee, se)
+    // Send response (<- e, ee, se) carrying our version as the payload.
     let len = handshake
-        .write_message(&[], &mut buf)
+        .write_message(&[PROTOCOL_VERSION], &mut buf)
         .context("Failed to write handshake message 2")?;
 
     let len_bytes = (len as u16).to_be_bytes();
@@ -496,7 +595,7 @@ async fn perform_handshake_split(
         .into_transport()
         .context("Failed to enter transport mode")?;
 
-    Ok((noise_transport, client_public))
+    Ok((noise_transport, client_public, client_version))
 }
 
 /// Send an encrypted frame using split write half
@@ -576,6 +675,8 @@ async fn handle_stream(
     mut data_rx: mpsc::Receiver<bytes::Bytes>,
     tunnel_tx: mpsc::Sender<StreamToTunnel>,
     allow_private: bool,
+    flow: Arc<StreamFlow>,
+    flow_enabled: bool,
 ) -> Result<()> {
     // Resolve + vet the destination before connecting (SSRF guard), then
     // connect to the vetted address rather than the hostname, so DNS can't
@@ -607,23 +708,36 @@ async fn handle_stream(
     let (mut target_read, mut target_write) = target.into_split();
     let tunnel_tx_clone = tunnel_tx.clone();
 
-    // Task to read from target and send to tunnel
+    // Task to read from target and send to tunnel (download direction). Gated by
+    // the client's send window so one slow client can't make us buffer without
+    // bound; backpressure here only affects this one destination socket.
     let target_to_tunnel = tokio::spawn(async move {
         let mut buf = vec![0u8; 32768];
-        loop {
-            match target_read.read(&mut buf).await {
-                Ok(0) => {
-                    // EOF from target
-                    break;
-                }
-                Ok(n) => {
-                    let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                    if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).await.is_err() {
-                        break;
-                    }
-                }
+        'outer: loop {
+            let n = match target_read.read(&mut buf).await {
+                Ok(0) => break,
+                Ok(n) => n,
                 Err(e) => {
                     debug!("Stream {} target read error: {}", stream_id, e);
+                    break;
+                }
+            };
+            if flow_enabled {
+                let mut sent = 0;
+                while sent < n {
+                    let got = flow.acquire(n - sent).await;
+                    if got == 0 {
+                        break 'outer; // stream closed
+                    }
+                    let data = bytes::Bytes::copy_from_slice(&buf[sent..sent + got]);
+                    if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).await.is_err() {
+                        break 'outer;
+                    }
+                    sent += got;
+                }
+            } else {
+                let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                if tunnel_tx_clone.send(StreamToTunnel::Data { stream_id, data }).await.is_err() {
                     break;
                 }
             }
@@ -632,11 +746,17 @@ async fn handle_stream(
         let _ = tunnel_tx_clone.send(StreamToTunnel::Close { stream_id }).await;
     });
 
-    // Task to read from tunnel and send to target
+    // Task to read from tunnel and send to target (upload direction). Report
+    // bytes drained so the server can replenish the client's send window.
+    let consumed_tx = tunnel_tx.clone();
     let tunnel_to_target = tokio::spawn(async move {
         while let Some(data) = data_rx.recv().await {
+            let n = data.len();
             if target_write.write_all(&data).await.is_err() {
                 break;
+            }
+            if flow_enabled && n > 0 {
+                let _ = consumed_tx.send(StreamToTunnel::Consumed { stream_id, bytes: n as u32 }).await;
             }
         }
     });
@@ -647,5 +767,67 @@ async fn handle_stream(
         _ = tunnel_to_target => {}
     }
 
+    Ok(())
+}
+
+/// Relay a UDP association. Outbound datagrams (ATYP|ADDR|PORT|data) arrive on
+/// `data_rx`; inbound datagrams are sent back as `StreamToTunnel::Udp` tagged
+/// with the source address. Destinations are SSRF-vetted. The session ends when
+/// the client closes the association (dropping `data_rx`) or after an idle
+/// period with no traffic in either direction.
+async fn handle_udp(
+    stream_id: u32,
+    mut data_rx: mpsc::Receiver<bytes::Bytes>,
+    tunnel_tx: mpsc::Sender<StreamToTunnel>,
+    allow_private: bool,
+) -> Result<()> {
+    use phantom_tunnel::tunnel::udp::UdpTarget;
+
+    let sock = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+    const UDP_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+    // Inbound: datagrams from destinations -> back through the tunnel.
+    let recv_sock = Arc::clone(&sock);
+    let recv_tx = tunnel_tx.clone();
+    let recv_task = tokio::spawn(async move {
+        let mut buf = vec![0u8; 65535];
+        loop {
+            let (n, src) = match tokio::time::timeout(UDP_IDLE, recv_sock.recv_from(&mut buf)).await {
+                Ok(Ok(v)) => v,
+                _ => break, // idle timeout or socket error
+            };
+            let mut payload = bytes::BytesMut::new();
+            udp::encode_ip(&mut payload, src);
+            payload.extend_from_slice(&buf[..n]);
+            if recv_tx.send(StreamToTunnel::Udp { stream_id, payload: payload.freeze() }).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // Outbound: datagrams from the client -> the destination.
+    while let Ok(Some(payload)) = tokio::time::timeout(UDP_IDLE, data_rx.recv()).await {
+        let (target, off) = match udp::parse_target(&payload) {
+            Some(v) => v,
+            None => continue,
+        };
+        let data = &payload[off..];
+        let dest = match target {
+            UdpTarget::Ip(a) => {
+                if allow_private || !is_blocked_ip(a.ip()) {
+                    Some(a)
+                } else {
+                    None
+                }
+            }
+            UdpTarget::Domain(h, p) => resolve_allowed(&format!("{}:{}", h, p), allow_private).await.ok(),
+        };
+        if let Some(dest) = dest {
+            let _ = sock.send_to(data, dest).await;
+        }
+    }
+
+    recv_task.abort();
+    let _ = tunnel_tx.send(StreamToTunnel::Close { stream_id }).await;
     Ok(())
 }

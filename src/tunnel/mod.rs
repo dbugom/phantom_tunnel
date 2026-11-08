@@ -6,10 +6,13 @@
 //! - Flow control
 //! - Padding injection
 
+mod flow;
 mod frame;
 mod multiplexer;
 mod stream;
+pub mod udp;
 
+pub use flow::StreamFlow;
 pub use frame::{Frame, FrameType, FRAME_HEADER_SIZE};
 pub use multiplexer::{Multiplexer, StreamCommand, StreamEvent, StreamHandle};
 pub use stream::{StreamState, TunnelStream};

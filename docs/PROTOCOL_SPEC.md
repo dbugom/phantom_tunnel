@@ -305,6 +305,19 @@ After handshake completion, all data is sent in encrypted frames.
 | PONG | 0x05 | Keepalive response |
 | GOAWAY | 0x06 | Connection shutdown |
 | PADDING | 0x07 | Padding only (no data) |
+| UDP_ASSOCIATE | 0x08 | Open a UDP association (v2) |
+| UDP_DATA | 0x09 | One UDP datagram: `ATYP\|ADDR\|PORT\|data` (v2) |
+
+**Protocol version negotiation:** the client sends a 1-byte version as the
+payload of Noise handshake message 1; the server replies with its version in
+message 2. Flow control (WINDOW_UPDATE) and UDP (0x08/0x09) are only used when
+both ends are v2. A missing/empty payload is treated as v1 for backward
+compatibility.
+
+**Flow control:** only DATA frames consume the per-stream send window. The
+receiver sends WINDOW_UPDATE(increment) as it drains data to its socket; the
+sender blocks that stream (only) when its window reaches zero. UDP_DATA is not
+flow-controlled (datagrams may be dropped under pressure).
 
 ### 6.3 Wire Format (Encrypted)
 

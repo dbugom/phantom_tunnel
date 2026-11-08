@@ -44,6 +44,10 @@ pub enum FrameType {
     GoAway = 0x06,
     /// Padding only (for traffic shaping)
     Padding = 0x07,
+    /// Open a UDP association (logical stream carrying datagrams). v2 only.
+    UdpAssociate = 0x08,
+    /// A single UDP datagram. Payload = ATYP | ADDR | PORT | data. v2 only.
+    UdpData = 0x09,
 }
 
 impl TryFrom<u8> for FrameType {
@@ -59,6 +63,8 @@ impl TryFrom<u8> for FrameType {
             0x05 => Ok(FrameType::Pong),
             0x06 => Ok(FrameType::GoAway),
             0x07 => Ok(FrameType::Padding),
+            0x08 => Ok(FrameType::UdpAssociate),
+            0x09 => Ok(FrameType::UdpData),
             _ => Err(TunnelError::InvalidFrame(format!(
                 "Unknown frame type: {}",
                 value
@@ -164,6 +170,26 @@ impl Frame {
             stream_id: 0,
             payload: Bytes::new(),
             padding_len: len.min(255) as u8,
+        }
+    }
+
+    /// Create a UDP-associate frame (opens a datagram stream).
+    pub fn udp_associate(stream_id: u32) -> Self {
+        Self {
+            frame_type: FrameType::UdpAssociate,
+            stream_id,
+            payload: Bytes::new(),
+            padding_len: 0,
+        }
+    }
+
+    /// Create a UDP data frame. `payload` is `ATYP | ADDR | PORT | datagram`.
+    pub fn udp_data(stream_id: u32, payload: Bytes) -> Self {
+        Self {
+            frame_type: FrameType::UdpData,
+            stream_id,
+            payload,
+            padding_len: 0,
         }
     }
 
