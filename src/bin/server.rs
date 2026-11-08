@@ -12,8 +12,8 @@ use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
     tunnel::{
-        udp, Frame, FrameType, StreamFlow, DEFAULT_WINDOW_SIZE, PROTOCOL_VERSION,
-        WINDOW_UPDATE_THRESHOLD,
+        udp, Frame, FrameType, InboundRx, InboundTx, RecvWindow, StreamFlow, DEFAULT_WINDOW_SIZE,
+        MAX_WINDOW_SIZE, PROTOCOL_VERSION,
     },
 };
 use std::collections::{HashMap, HashSet};
@@ -73,11 +73,12 @@ enum StreamToTunnel {
 
 /// Active stream with channel to send data to it
 struct ActiveStream {
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    /// Forwards payloads from the client to the destination task.
+    inbound: InboundTx,
     /// Send-side credit window (server -> client direction).
     flow: Arc<StreamFlow>,
-    /// Bytes delivered to the destination since the last WindowUpdate sent.
-    delivered: u32,
+    /// Receive window for the client's uploads on this stream.
+    recv: RecvWindow,
 }
 
 /// Remove a stream and release any sender task blocked on its send window.
@@ -89,6 +90,11 @@ fn remove_stream(streams: &mut HashMap<u32, ActiveStream>, id: u32) {
 
 /// Initial per-stream send window as a signed credit count.
 const INITIAL_WINDOW: i64 = DEFAULT_WINDOW_SIZE as i64;
+
+/// Largest receive window the server grants per stream (uploads). Half the
+/// client's, because the server runs under a 512 MB memory limit and serves
+/// many clients; still about 500 Mbit/s per connection at a 120 ms round trip.
+const SERVER_MAX_WINDOW: u32 = MAX_WINDOW_SIZE / 2;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -388,12 +394,16 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
 
                                 trace!("Opening stream {}", stream_id);
 
-                                let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(256);
+                                let (inbound, data_rx) = if flow_enabled {
+                                    InboundTx::credit()
+                                } else {
+                                    InboundTx::blocking(256)
+                                };
                                 let flow = Arc::new(StreamFlow::new(INITIAL_WINDOW));
                                 active_streams.insert(stream_id, ActiveStream {
-                                    data_tx,
+                                    inbound,
                                     flow: Arc::clone(&flow),
-                                    delivered: 0,
+                                    recv: RecvWindow::new(SERVER_MAX_WINDOW),
                                 });
 
                                 let tunnel_tx = tunnel_tx.clone();
@@ -407,11 +417,11 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                             FrameType::UdpAssociate => {
                                 let stream_id = frame.stream_id;
                                 trace!("Opening UDP association {}", stream_id);
-                                let (data_tx, data_rx) = mpsc::channel::<bytes::Bytes>(1024);
+                                let (inbound, data_rx) = InboundTx::datagram(1024);
                                 active_streams.insert(stream_id, ActiveStream {
-                                    data_tx,
+                                    inbound,
                                     flow: Arc::new(StreamFlow::new(INITIAL_WINDOW)),
-                                    delivered: 0,
+                                    recv: RecvWindow::new(SERVER_MAX_WINDOW),
                                 });
                                 let tunnel_tx = tunnel_tx.clone();
                                 let allow_private = state.allow_private_destinations;
@@ -423,21 +433,16 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                             }
                             FrameType::Data => {
                                 let stream_id = frame.stream_id;
-                                if let Some(active) = active_streams.get(&stream_id) {
-                                    if flow_enabled {
-                                        match active.data_tx.try_send(frame.payload) {
-                                            Ok(()) => {}
-                                            Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                remove_stream(&mut active_streams, stream_id);
-                                            }
-                                            Err(mpsc::error::TrySendError::Full(_)) => {
-                                                debug!("Stream {} exceeded window; resetting", stream_id);
-                                                remove_stream(&mut active_streams, stream_id);
-                                                let f = Frame::stream_close(stream_id);
-                                                send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
-                                            }
-                                        }
-                                    } else if active.data_tx.send(frame.payload).await.is_err() {
+                                if let Some(active) = active_streams.get_mut(&stream_id) {
+                                    // v2: memory is bounded by our receive window, so a
+                                    // client sending past it is cut off. (v1 clients have
+                                    // no window; their channel blocks instead.)
+                                    if flow_enabled && active.recv.on_received(frame.payload.len()).is_err() {
+                                        debug!("Stream {} exceeded window; resetting", stream_id);
+                                        remove_stream(&mut active_streams, stream_id);
+                                        let f = Frame::stream_close(stream_id);
+                                        send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
+                                    } else if active.inbound.send(frame.payload).await.is_err() {
                                         remove_stream(&mut active_streams, stream_id);
                                     }
                                 }
@@ -445,8 +450,8 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                             FrameType::UdpData => {
                                 let stream_id = frame.stream_id;
                                 if let Some(active) = active_streams.get(&stream_id) {
-                                    // Drop datagram under pressure (lossy by nature).
-                                    let _ = active.data_tx.try_send(frame.payload);
+                                    // Datagram channel: a full channel drops it.
+                                    let _ = active.inbound.send(frame.payload).await;
                                 }
                             }
                             FrameType::WindowUpdate => {
@@ -499,10 +504,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
                     StreamToTunnel::Consumed { stream_id, bytes } => {
                         if flow_enabled {
                             if let Some(active) = active_streams.get_mut(&stream_id) {
-                                active.delivered = active.delivered.saturating_add(bytes);
-                                if active.delivered >= WINDOW_UPDATE_THRESHOLD {
-                                    let inc = active.delivered;
-                                    active.delivered = 0;
+                                if let Some(inc) = active.recv.on_drained(bytes) {
                                     let f = Frame::window_update(stream_id, inc);
                                     send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
                                 }
@@ -671,7 +673,7 @@ async fn resolve_allowed(
 async fn handle_stream(
     stream_id: u32,
     destination: String,
-    mut data_rx: mpsc::Receiver<bytes::Bytes>,
+    mut data_rx: InboundRx,
     tunnel_tx: mpsc::Sender<StreamToTunnel>,
     allow_private: bool,
     flow: Arc<StreamFlow>,
@@ -776,7 +778,7 @@ async fn handle_stream(
 /// period with no traffic in either direction.
 async fn handle_udp(
     stream_id: u32,
-    mut data_rx: mpsc::Receiver<bytes::Bytes>,
+    mut data_rx: InboundRx,
     tunnel_tx: mpsc::Sender<StreamToTunnel>,
     allow_private: bool,
 ) -> Result<()> {

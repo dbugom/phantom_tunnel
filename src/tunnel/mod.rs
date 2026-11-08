@@ -1,7 +1,9 @@
 //! Tunnel layer: what travels inside the Noise-encrypted connection.
 //!
 //! - [`Frame`] / [`FrameType`]: the frame format (one frame per Noise message)
-//! - [`StreamFlow`]: per-stream credit-based send window (flow control)
+//! - [`StreamFlow`] / [`RecvWindow`]: per-stream credit-based flow control,
+//!   with receive windows that grow when the reader keeps up
+//! - [`InboundTx`] / [`InboundRx`]: event loop → local socket channel
 //! - [`udp`]: the address header carried by `UdpData` frames
 //!
 //! The constants below are the protocol parameters both `phantom-server` and
@@ -9,9 +11,11 @@
 
 mod flow;
 mod frame;
+mod inbound;
 pub mod udp;
 
-pub use flow::StreamFlow;
+pub use flow::{RecvWindow, StreamFlow, WindowViolation};
+pub use inbound::{InboundClosed, InboundRx, InboundTx};
 pub use frame::{Frame, FrameType, FRAME_HEADER_SIZE};
 
 use thiserror::Error;
@@ -34,6 +38,6 @@ pub const MAX_STREAMS: usize = 1024;
 /// peer starts with this much credit.
 pub const DEFAULT_WINDOW_SIZE: u32 = 262_144;
 
-/// A receiver sends a `WindowUpdate` once this many bytes have been drained
-/// since the last one (half the window).
-pub const WINDOW_UPDATE_THRESHOLD: u32 = DEFAULT_WINDOW_SIZE / 2;
+/// Largest per-stream receive window the client grants (16 MiB). At a 120 ms
+/// round trip that allows roughly 1 Gbit/s on a single connection.
+pub const MAX_WINDOW_SIZE: u32 = 16 * 1024 * 1024;

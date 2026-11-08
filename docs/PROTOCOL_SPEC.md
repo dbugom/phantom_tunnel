@@ -327,6 +327,14 @@ receiver sends WINDOW_UPDATE(increment) as it drains data to its socket; the
 sender blocks that stream (only) when its window reaches zero. UDP_DATA is not
 flow-controlled (datagrams may be dropped under pressure).
 
+**Window growth:** every stream starts with a 256 KB window. When a receiver
+sends a WINDOW_UPDATE and finds that its local reader has kept up (little data
+still waiting), it adds extra credit to that update, doubling the stream's
+window, up to 16 MiB on the client and 8 MiB on the server. Without growth a
+single stream is capped at window ÷ round-trip time (about 17 Mbit/s at
+118 ms). This uses only ordinary WINDOW_UPDATE frames, so senders need no
+change.
+
 ### 6.3 Wire Format (Encrypted)
 
 Frames are encrypted with ChaCha20-Poly1305 before transmission:

@@ -48,6 +48,11 @@ tempfile = "3.15"
 name = "tunnel_bench"
 harness = false
 
+# Optimise dependencies (snow / ChaCha20-Poly1305) even in debug and test
+# builds. Unoptimised crypto is slow enough to dominate the throughput tests.
+[profile.dev.package."*"]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true

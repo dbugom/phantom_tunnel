@@ -127,6 +127,12 @@ struct Tunnel {
 /// `enable_padding`, settings removed from the code, to prove older config
 /// files keep working end to end.
 async fn launch(allow_private: bool) -> Tunnel {
+    launch_with(allow_private, None).await
+}
+
+/// Like [`launch`], but optionally puts a relay that delays every chunk by
+/// `one_way` in each direction between client and server (simulated latency).
+async fn launch_with(allow_private: bool, one_way: Option<Duration>) -> Tunnel {
     let dir = tempfile::tempdir().unwrap();
     let server_kp = KeyPair::generate().unwrap();
     let client_kp = KeyPair::generate().unwrap();
@@ -146,9 +152,14 @@ async fn launch(allow_private: bool) -> Tunnel {
         client_kp.public.to_base64(),
         allow_private,
     );
+    // Where the client dials: the server itself, or a delay relay in front of it.
+    let dial_addr = match one_way {
+        Some(d) => spawn_delay_relay(server_addr.clone(), d).await,
+        None => server_addr.clone(),
+    };
     let client_cfg = format!(
         "[client]\nserver = \"{}\"\nserver_public_key = \"{}\"\nprivate_key = \"{}\"\npublic_key = \"{}\"\nsocks5_listen = \"{}\"\nhttp_listen = \"{}\"\ntls_profile = \"chrome\"\nenable_padding = false\n\n[logging]\nlevel = \"warn\"\nformat = \"compact\"\n",
-        server_addr,
+        dial_addr,
         server_kp.public.to_base64(),
         client_kp.private.to_base64(),
         client_kp.public.to_base64(),
@@ -745,4 +756,161 @@ async fn throughput() {
     }
     report("upload", TOTAL, start.elapsed().as_secs_f64());
     drop(s);
+}
+
+// ---------------------------------------------------------------------------
+// Simulated latency
+// ---------------------------------------------------------------------------
+
+/// Copy `r` to `w`, releasing each chunk `delay` after it was read. Chunks are
+/// pipelined, so this adds latency without limiting bandwidth.
+async fn delayed_pipe(
+    mut r: tokio::net::tcp::OwnedReadHalf,
+    mut w: tokio::net::tcp::OwnedWriteHalf,
+    delay: Duration,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    tokio::spawn(async move {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            match r.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.send((tokio::time::Instant::now() + delay, buf[..n].to_vec())).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    while let Some((due, data)) = rx.recv().await {
+        tokio::time::sleep_until(due).await;
+        if w.write_all(&data).await.is_err() {
+            break;
+        }
+    }
+    let _ = w.shutdown().await;
+}
+
+/// A TCP relay to `upstream` that adds `one_way` delay in each direction.
+async fn spawn_delay_relay(upstream: String, one_way: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((down, _)) = listener.accept().await {
+            let upstream = upstream.clone();
+            tokio::spawn(async move {
+                let up = match TcpStream::connect(&upstream).await {
+                    Ok(u) => u,
+                    Err(_) => return,
+                };
+                down.set_nodelay(true).ok();
+                up.set_nodelay(true).ok();
+                let (dr, dw) = down.into_split();
+                let (ur, uw) = up.into_split();
+                tokio::spawn(delayed_pipe(dr, uw, one_way));
+                delayed_pipe(ur, dw, one_way).await;
+            });
+        }
+    });
+    addr
+}
+
+/// Download throughput at a simulated 118 ms round trip, for 1 and 8
+/// parallel connections (a speed test uses several). Ignored by default; run:
+///
+///   cargo test --release --test e2e_proxy -- --ignored --nocapture throughput_at_118ms
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn throughput_at_118ms_rtt() {
+    // Source that streams data until the client goes away.
+    let src = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let src_addr = src.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = src.accept().await {
+            tokio::spawn(async move {
+                let chunk = vec![0x5Au8; 64 * 1024];
+                while sock.write_all(&chunk).await.is_ok() {}
+            });
+        }
+    });
+
+    let echo = spawn_echo().await;
+    let t = launch_with(true, Some(Duration::from_millis(59))).await;
+    wait_ready(&t.socks, &echo).await;
+
+    for parallel in [1usize, 8] {
+        let measure = Duration::from_secs(6);
+        let mut tasks = Vec::new();
+        for _ in 0..parallel {
+            let (socks, src) = (t.socks.clone(), src_addr.clone());
+            tasks.push(tokio::spawn(async move {
+                let mut s = socks5_connect(&socks, &src).await.unwrap();
+                let mut buf = vec![0u8; 256 * 1024];
+                // 2 s warm-up, then count bytes for `measure`.
+                let warm = tokio::time::Instant::now() + Duration::from_secs(2);
+                while tokio::time::Instant::now() < warm {
+                    if s.read(&mut buf).await.unwrap_or(0) == 0 {
+                        return 0u64;
+                    }
+                }
+                let end = tokio::time::Instant::now() + measure;
+                let mut got = 0u64;
+                while tokio::time::Instant::now() < end {
+                    match s.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n as u64,
+                    }
+                }
+                got
+            }));
+        }
+        let mut total = 0u64;
+        for task in tasks {
+            total += task.await.unwrap();
+        }
+        let mbit = total as f64 * 8.0 / 1_000_000.0 / measure.as_secs_f64();
+        println!("118 ms RTT, {} connection(s): {:.0} Mbit/s total", parallel, mbit);
+    }
+}
+
+/// Regression test for the v2 slowdown: with a fixed 256 KB per-stream window
+/// a single connection was capped at window/RTT (about 17 Mbit/s at a 118 ms
+/// round trip). Receive windows must grow so one connection goes well beyond.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_stream_is_not_window_limited_at_high_latency() {
+    let src = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let src_addr = src.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = src.accept().await {
+            tokio::spawn(async move {
+                let chunk = vec![0x5Au8; 64 * 1024];
+                while sock.write_all(&chunk).await.is_ok() {}
+            });
+        }
+    });
+
+    let echo = spawn_echo().await;
+    let t = launch_with(true, Some(Duration::from_millis(59))).await; // 118 ms RTT
+    wait_ready(&t.socks, &echo).await;
+
+    let mut s = socks5_connect(&t.socks, &src_addr).await.unwrap();
+    let mut buf = vec![0u8; 256 * 1024];
+    let warm = tokio::time::Instant::now() + Duration::from_secs(2);
+    while tokio::time::Instant::now() < warm {
+        assert!(s.read(&mut buf).await.unwrap() > 0);
+    }
+    let measure = Duration::from_secs(3);
+    let end = tokio::time::Instant::now() + measure;
+    let mut got = 0u64;
+    while tokio::time::Instant::now() < end {
+        got += s.read(&mut buf).await.unwrap() as u64;
+    }
+    let mbit = got as f64 * 8.0 / 1e6 / measure.as_secs_f64();
+    println!("one connection at 118 ms RTT: {:.0} Mbit/s", mbit);
+    assert!(
+        mbit > 100.0,
+        "one connection at 118 ms RTT reached only {:.0} Mbit/s; the receive window is not growing",
+        mbit
+    );
 }

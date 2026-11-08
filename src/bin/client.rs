@@ -12,8 +12,8 @@ use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
     tunnel::{
-        udp, Frame, FrameType, StreamFlow, DEFAULT_WINDOW_SIZE, MAX_STREAMS, PROTOCOL_VERSION,
-        WINDOW_UPDATE_THRESHOLD,
+        udp, Frame, FrameType, InboundRx, InboundTx, RecvWindow, StreamFlow, DEFAULT_WINDOW_SIZE,
+        MAX_STREAMS, MAX_WINDOW_SIZE, PROTOCOL_VERSION,
     },
 };
 use std::collections::HashMap;
@@ -83,7 +83,7 @@ struct OpenStreamRequest {
 /// server-side closes never reached the local application.)
 struct StreamConnection {
     stream_id: u32,
-    data_rx: mpsc::Receiver<bytes::Bytes>,
+    data_rx: InboundRx,
     /// Send-side credit window for this stream (granted by the server's
     /// WindowUpdate frames). The uploader task acquires credit before sending.
     flow: Arc<StreamFlow>,
@@ -114,7 +114,7 @@ enum TunnelCommand {
 struct UdpSession {
     stream_id: u32,
     /// Inbound datagrams from the tunnel (each ATYP|ADDR|PORT|data).
-    rx: mpsc::Receiver<bytes::Bytes>,
+    rx: InboundRx,
 }
 
 /// Shared tunnel handle for proxy handlers
@@ -332,11 +332,12 @@ fn generate_keypair() -> Result<()> {
 /// Active stream state in the tunnel
 struct ActiveStream {
     /// Forwards inbound payloads to the local consumer task.
-    data_tx: mpsc::Sender<bytes::Bytes>,
+    inbound: InboundTx,
     /// Send-side credit window (shared with the uploader task).
     flow: Arc<StreamFlow>,
-    /// Bytes delivered to the consumer since the last WindowUpdate we sent.
-    delivered: u32,
+    /// Receive window: what the server may have in flight to us (grows when
+    /// the local reader keeps up).
+    recv: RecvWindow,
 }
 
 /// Message from the reader task
@@ -481,28 +482,17 @@ async fn run_tunnel(
                         if let Some(frame) = Frame::decode(&mut frame_bytes)? {
                             match frame.frame_type {
                                 FrameType::Data => {
-                                    if let Some(active) = active_streams.get(&frame.stream_id) {
-                                        if flow_enabled {
-                                            // Peer respects our window, so the bounded
-                                            // channel can't overflow under correct
-                                            // behaviour; `Full` means a violation.
-                                            match active.data_tx.try_send(frame.payload) {
-                                                Ok(()) => {}
-                                                Err(mpsc::error::TrySendError::Closed(_)) => {
-                                                    remove_stream(&mut active_streams, frame.stream_id);
-                                                }
-                                                Err(mpsc::error::TrySendError::Full(_)) => {
-                                                    debug!("Stream {} exceeded window; resetting", frame.stream_id);
-                                                    remove_stream(&mut active_streams, frame.stream_id);
-                                                    let f = Frame::stream_close(frame.stream_id);
-                                                    send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
-                                                }
-                                            }
-                                        } else {
-                                            // v1 server: no flow control, block-forward.
-                                            if active.data_tx.send(frame.payload).await.is_err() {
-                                                remove_stream(&mut active_streams, frame.stream_id);
-                                            }
+                                    if let Some(active) = active_streams.get_mut(&frame.stream_id) {
+                                        // v2: memory is bounded by our receive window, so a
+                                        // server sending past it is cut off. (v1 servers have
+                                        // no window; their channel blocks instead.)
+                                        if flow_enabled && active.recv.on_received(frame.payload.len()).is_err() {
+                                            debug!("Stream {} exceeded window; resetting", frame.stream_id);
+                                            remove_stream(&mut active_streams, frame.stream_id);
+                                            let f = Frame::stream_close(frame.stream_id);
+                                            send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
+                                        } else if active.inbound.send(frame.payload).await.is_err() {
+                                            remove_stream(&mut active_streams, frame.stream_id);
                                         }
                                     }
                                 }
@@ -510,9 +500,8 @@ async fn run_tunnel(
                                     // Deliver datagram to the UDP session; drop oldest
                                     // under pressure (datagram semantics allow loss).
                                     if let Some(active) = active_streams.get(&frame.stream_id) {
-                                        if active.data_tx.try_send(frame.payload).is_err() {
-                                            // channel full or closed: drop this datagram
-                                        }
+                                        // Datagram channel: a full channel drops it.
+                                        let _ = active.inbound.send(frame.payload).await;
                                     }
                                 }
                                 FrameType::WindowUpdate => {
@@ -583,12 +572,16 @@ async fn run_tunnel(
                             return Err(e);
                         }
 
-                        let (data_tx, data_rx) = mpsc::channel(256);
+                        let (inbound, data_rx) = if flow_enabled {
+                            InboundTx::credit()
+                        } else {
+                            InboundTx::blocking(256)
+                        };
                         let flow = Arc::new(StreamFlow::new(INITIAL_WINDOW));
                         active_streams.insert(stream_id, ActiveStream {
-                            data_tx,
+                            inbound,
                             flow: Arc::clone(&flow),
-                            delivered: 0,
+                            recv: RecvWindow::new(MAX_WINDOW_SIZE),
                         });
 
                         let conn = StreamConnection { stream_id, data_rx, flow, flow_enabled };
@@ -613,11 +606,11 @@ async fn run_tunnel(
                             return Err(e);
                         }
                         // Larger buffer: datagrams can burst.
-                        let (data_tx, rx) = mpsc::channel(1024);
+                        let (inbound, rx) = InboundTx::datagram(1024);
                         active_streams.insert(stream_id, ActiveStream {
-                            data_tx,
+                            inbound,
                             flow: Arc::new(StreamFlow::new(INITIAL_WINDOW)),
-                            delivered: 0,
+                            recv: RecvWindow::new(MAX_WINDOW_SIZE),
                         });
                         let _ = response_tx.send(Ok(UdpSession { stream_id, rx }));
                     }
@@ -637,10 +630,7 @@ async fn run_tunnel(
                     TunnelCommand::StreamConsumed { stream_id, bytes } => {
                         if flow_enabled {
                             if let Some(active) = active_streams.get_mut(&stream_id) {
-                                active.delivered = active.delivered.saturating_add(bytes);
-                                if active.delivered >= WINDOW_UPDATE_THRESHOLD {
-                                    let inc = active.delivered;
-                                    active.delivered = 0;
+                                if let Some(inc) = active.recv.on_drained(bytes) {
                                     let f = Frame::window_update(stream_id, inc);
                                     send_frame_write(&mut write_half, &mut noise_transport, &f).await?;
                                 }
