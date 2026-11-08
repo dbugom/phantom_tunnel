@@ -44,6 +44,10 @@ base64 = "0.22"
 criterion = { version = "0.5", features = ["html_reports"] }
 tempfile = "3.15"
 
+[[bench]]
+name = "tunnel_bench"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = true

@@ -110,17 +110,33 @@ async fn spawn_echo() -> String {
     addr
 }
 
-/// Write server + client configs and launch both binaries. Returns guards and
-/// the SOCKS listen address.
-async fn launch(allow_private: bool) -> (tempfile::TempDir, ChildGuard, ChildGuard, String) {
+/// A running server + client pair. Dropping it stops both processes.
+struct Tunnel {
+    _dir: tempfile::TempDir,
+    _server: ChildGuard,
+    _client: ChildGuard,
+    /// Client SOCKS5 proxy address.
+    socks: String,
+    /// Client HTTP CONNECT proxy address.
+    http: String,
+}
+
+/// Write server + client configs and launch both binaries.
+///
+/// The client config deliberately still contains `tls_profile` and
+/// `enable_padding`, settings removed from the code, to prove older config
+/// files keep working end to end.
+async fn launch(allow_private: bool) -> Tunnel {
     let dir = tempfile::tempdir().unwrap();
     let server_kp = KeyPair::generate().unwrap();
     let client_kp = KeyPair::generate().unwrap();
 
     let server_port = free_port().await;
     let socks_port = free_port().await;
+    let http_port = free_port().await;
     let server_addr = format!("127.0.0.1:{}", server_port);
     let socks_addr = format!("127.0.0.1:{}", socks_port);
+    let http_addr = format!("127.0.0.1:{}", http_port);
 
     let server_cfg = format!(
         "[server]\nlisten = \"{}\"\nprivate_key = \"{}\"\npublic_key = \"{}\"\nallowed_clients = [\"{}\"]\nmax_connections = 1000\nallow_private_destinations = {}\n\n[logging]\nlevel = \"warn\"\nformat = \"compact\"\n",
@@ -131,12 +147,13 @@ async fn launch(allow_private: bool) -> (tempfile::TempDir, ChildGuard, ChildGua
         allow_private,
     );
     let client_cfg = format!(
-        "[client]\nserver = \"{}\"\nserver_public_key = \"{}\"\nprivate_key = \"{}\"\npublic_key = \"{}\"\nsocks5_listen = \"{}\"\ntls_profile = \"chrome\"\nenable_padding = false\n\n[logging]\nlevel = \"warn\"\nformat = \"compact\"\n",
+        "[client]\nserver = \"{}\"\nserver_public_key = \"{}\"\nprivate_key = \"{}\"\npublic_key = \"{}\"\nsocks5_listen = \"{}\"\nhttp_listen = \"{}\"\ntls_profile = \"chrome\"\nenable_padding = false\n\n[logging]\nlevel = \"warn\"\nformat = \"compact\"\n",
         server_addr,
         server_kp.public.to_base64(),
         client_kp.private.to_base64(),
         client_kp.public.to_base64(),
         socks_addr,
+        http_addr,
     );
 
     let server_cfg_path = dir.path().join("server.toml");
@@ -157,7 +174,13 @@ async fn launch(allow_private: bool) -> (tempfile::TempDir, ChildGuard, ChildGua
         .spawn()
         .expect("spawn client");
 
-    (dir, ChildGuard(server), ChildGuard(client), socks_addr)
+    Tunnel {
+        _dir: dir,
+        _server: ChildGuard(server),
+        _client: ChildGuard(client),
+        socks: socks_addr,
+        http: http_addr,
+    }
 }
 
 /// Wait until a full round-trip through the tunnel succeeds (both processes up
@@ -177,7 +200,8 @@ async fn wait_ready(socks: &str, echo: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn many_sequential_connections() {
     let echo = spawn_echo().await;
-    let (_dir, _server, _client, socks) = launch(true).await;
+    let t = launch(true).await;
+    let socks = t.socks.clone();
     wait_ready(&socks, &echo).await;
 
     // The old client exhausted stream IDs after 1024 opens; go well past that.
@@ -197,7 +221,8 @@ async fn many_sequential_connections() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn larger_payload_integrity() {
     let echo = spawn_echo().await;
-    let (_dir, _server, _client, socks) = launch(true).await;
+    let t = launch(true).await;
+    let socks = t.socks.clone();
     wait_ready(&socks, &echo).await;
 
     // ~256 KB exercises multiple frames and flow in both directions.
@@ -209,7 +234,8 @@ async fn larger_payload_integrity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ssrf_guard_blocks_private_by_default() {
     let echo = spawn_echo().await; // echo is on 127.0.0.1 (private/loopback)
-    let (_dir, _server, _client, socks) = launch(false).await; // allow_private = false
+    let t = launch(false).await; // allow_private = false
+    let socks = t.socks.clone();
     // Wait for the SOCKS listener.
     for _ in 0..100 {
         if TcpStream::connect(&socks).await.is_ok() {
@@ -290,7 +316,8 @@ async fn socks5_connect(socks: &str, target: &str) -> std::io::Result<TcpStream>
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_stream_does_not_block_others() {
     let echo = spawn_echo().await;
-    let (_dir, _server, _client, socks) = launch(true).await;
+    let t = launch(true).await;
+    let socks = t.socks.clone();
     wait_ready(&socks, &echo).await;
 
     // Stalled stream: send ~2 MB and never read the echo back.
@@ -329,7 +356,8 @@ async fn slow_stream_does_not_block_others() {
 async fn udp_associate_round_trip() {
     let udp_echo = spawn_udp_echo().await;
     let tcp_echo = spawn_echo().await; // for wait_ready
-    let (_dir, _server, _client, socks) = launch(true).await;
+    let t = launch(true).await;
+    let socks = t.socks.clone();
     wait_ready(&socks, &tcp_echo).await;
 
     // UDP ASSOCIATE handshake on a TCP control connection.
@@ -473,4 +501,248 @@ async fn v1_client_still_works_against_v2_server() {
         .await
         .expect("v1 client should receive the echo");
     assert_eq!(&frame.payload[..], b"legacy", "v1 round trip must work");
+}
+
+// ---------------------------------------------------------------------------
+// HTTP CONNECT proxy
+// ---------------------------------------------------------------------------
+
+/// Read an HTTP response head (up to the blank line) and return it as text.
+async fn read_http_head(s: &mut TcpStream) -> std::io::Result<String> {
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if s.read(&mut byte).await? == 0 {
+            break;
+        }
+        head.push(byte[0]);
+        if head.len() > 8192 {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Send `CONNECT target` to the HTTP proxy; return the stream and the status line.
+async fn http_connect(proxy: &str, target: &str) -> std::io::Result<(TcpStream, String)> {
+    let mut s = TcpStream::connect(proxy).await?;
+    s.set_nodelay(true).ok();
+    let req = format!(
+        "CONNECT {t} HTTP/1.1\r\nHost: {t}\r\nUser-Agent: e2e-test\r\nProxy-Connection: keep-alive\r\n\r\n",
+        t = target
+    );
+    s.write_all(req.as_bytes()).await?;
+    let head = read_http_head(&mut s).await?;
+    let status = head.lines().next().unwrap_or("").to_string();
+    Ok((s, status))
+}
+
+async fn http_roundtrip(proxy: &str, target: &str, payload: &[u8]) -> std::io::Result<Vec<u8>> {
+    let (mut s, status) = http_connect(proxy, target).await?;
+    if !status.starts_with("HTTP/1.1 200") {
+        return Err(std::io::Error::other(format!("CONNECT refused: {}", status)));
+    }
+    s.write_all(payload).await?;
+    let mut buf = vec![0u8; payload.len()];
+    s.read_exact(&mut buf).await?;
+    Ok(buf)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_connect_round_trip_and_large_payload() {
+    let echo = spawn_echo().await;
+    let t = launch(true).await;
+    wait_ready(&t.socks, &echo).await;
+
+    let r = http_roundtrip(&t.http, &echo, b"hello over http connect").await.unwrap();
+    assert_eq!(r, b"hello over http connect");
+
+    // 1 MB crosses the 256 KB flow-control window several times in each direction.
+    let payload: Vec<u8> = (0..1024 * 1024).map(|i| (i % 253) as u8).collect();
+    let r = http_roundtrip(&t.http, &echo, &payload).await.unwrap();
+    assert_eq!(r, payload, "1 MB must echo back byte-for-byte through the HTTP proxy");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_connect_many_sequential() {
+    let echo = spawn_echo().await;
+    let t = launch(true).await;
+    wait_ready(&t.socks, &echo).await;
+    for i in 0..300 {
+        let msg = format!("http-{:04}", i);
+        let r = http_roundtrip(&t.http, &echo, msg.as_bytes())
+            .await
+            .unwrap_or_else(|e| panic!("HTTP CONNECT #{} failed: {}", i, e));
+        assert_eq!(r, msg.as_bytes());
+    }
+}
+
+/// Only CONNECT is supported: a plain `GET http://…` (what a system proxy sends
+/// for http:// URLs) is refused with 405 rather than mishandled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_proxy_rejects_non_connect_requests() {
+    let echo = spawn_echo().await;
+    let t = launch(true).await;
+    wait_ready(&t.socks, &echo).await;
+
+    let mut s = TcpStream::connect(&t.http).await.unwrap();
+    s.write_all(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .await
+        .unwrap();
+    let head = tokio::time::timeout(Duration::from_secs(5), read_http_head(&mut s))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(head.starts_with("HTTP/1.1 405"), "got: {:?}", head);
+}
+
+/// With the SSRF guard on (the default), CONNECT to a loopback destination is
+/// accepted by the local proxy but closed by the server without data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn http_connect_to_private_destination_is_blocked() {
+    let echo = spawn_echo().await; // 127.0.0.1 — private
+    let t = launch(false).await;
+    for _ in 0..100 {
+        if TcpStream::connect(&t.http).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let err = http_roundtrip(&t.http, &echo, b"should-not-arrive")
+        .await
+        .expect_err("loopback must be refused when allow_private_destinations=false");
+    assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof, "{}", err);
+}
+
+/// SOCKS5 and HTTP clients share the same tunnel concurrently.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn socks_and_http_concurrently_share_one_tunnel() {
+    let echo = spawn_echo().await;
+    let t = launch(true).await;
+    wait_ready(&t.socks, &echo).await;
+
+    let mut tasks = Vec::new();
+    for i in 0..20 {
+        let (socks, http, echo) = (t.socks.clone(), t.http.clone(), echo.clone());
+        tasks.push(tokio::spawn(async move {
+            let a = format!("socks-{:02}-{}", i, "x".repeat(i * 100));
+            let b = format!("http-{:02}-{}", i, "y".repeat(i * 100));
+            let (ra, rb) = tokio::join!(
+                socks5_roundtrip(&socks, &echo, a.as_bytes()),
+                http_roundtrip(&http, &echo, b.as_bytes())
+            );
+            assert_eq!(ra.unwrap(), a.as_bytes());
+            assert_eq!(rb.unwrap(), b.as_bytes());
+        }));
+    }
+    for task in tasks {
+        tokio::time::timeout(Duration::from_secs(20), task)
+            .await
+            .expect("concurrent round trips must finish")
+            .unwrap();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Throughput (on demand)
+// ---------------------------------------------------------------------------
+
+/// Measures download and upload throughput through the real binaries on
+/// loopback. Ignored by default because the numbers depend on the machine;
+/// run with:
+///
+///   cargo test --release --test e2e_proxy -- --ignored --nocapture throughput
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn throughput() {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+    const TOTAL: u64 = 256 * 1024 * 1024; // 256 MiB each way
+
+    // Source: sends TOTAL bytes then closes.
+    let src = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let src_addr = src.local_addr().unwrap().to_string();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = src.accept().await {
+            tokio::spawn(async move {
+                let chunk = vec![0x5Au8; 64 * 1024];
+                let mut sent = 0u64;
+                while sent < TOTAL {
+                    if sock.write_all(&chunk).await.is_err() {
+                        return;
+                    }
+                    sent += chunk.len() as u64;
+                }
+                let _ = sock.shutdown().await;
+            });
+        }
+    });
+
+    // Sink: counts bytes received.
+    let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let sink_addr = sink.local_addr().unwrap().to_string();
+    let received = Arc::new(AtomicU64::new(0));
+    let rx = Arc::clone(&received);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = sink.accept().await {
+            let rx = Arc::clone(&rx);
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = sock.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
+                    rx.fetch_add(n as u64, Ordering::Relaxed);
+                }
+            });
+        }
+    });
+
+    let echo = spawn_echo().await;
+    let t = launch(true).await;
+    wait_ready(&t.socks, &echo).await;
+
+    let report = |dir: &str, bytes: u64, secs: f64| {
+        let mib_s = bytes as f64 / (1024.0 * 1024.0) / secs;
+        println!(
+            "{:>8}: {} MiB in {:.2}s = {:.1} MiB/s ({:.0} Mbit/s)",
+            dir,
+            bytes / (1024 * 1024),
+            secs,
+            mib_s,
+            mib_s * 8.388_608
+        );
+    };
+
+    // Download: server-side source -> client.
+    let start = std::time::Instant::now();
+    let mut s = socks5_connect(&t.socks, &src_addr).await.unwrap();
+    let mut buf = vec![0u8; 256 * 1024];
+    let mut got = 0u64;
+    loop {
+        let n = s.read(&mut buf).await.unwrap();
+        if n == 0 {
+            break;
+        }
+        got += n as u64;
+    }
+    report("download", got, start.elapsed().as_secs_f64());
+    assert_eq!(got, TOTAL, "download must deliver every byte");
+
+    // Upload: client -> server-side sink. Timed until the sink has it all.
+    let start = std::time::Instant::now();
+    let mut s = socks5_connect(&t.socks, &sink_addr).await.unwrap();
+    let chunk = vec![0xA5u8; 64 * 1024];
+    let mut sent = 0u64;
+    while sent < TOTAL {
+        s.write_all(&chunk).await.unwrap();
+        sent += chunk.len() as u64;
+    }
+    while received.load(Ordering::Relaxed) < TOTAL {
+        assert!(start.elapsed() < Duration::from_secs(120), "upload stalled");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    report("upload", TOTAL, start.elapsed().as_secs_f64());
+    drop(s);
 }
