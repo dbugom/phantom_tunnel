@@ -20,7 +20,7 @@
 //! standard base64, with or without padding. Unknown query parameters are
 //! ignored so that later versions can add fields.
 
-use crate::config::{BackupServer, ClientConfig};
+use crate::config::{BackupServer, ClientConfig, ClientTransportConfig};
 use crate::crypto::{KeyPair, PrivateKey, PublicKey, KEY_LEN};
 use base64::Engine;
 use std::fmt;
@@ -57,6 +57,8 @@ pub enum LinkError {
     EmptyValue(String),
     #[error("bad percent-encoding in link")]
     BadEncoding,
+    #[error("unknown transport {0:?} in link (expected ws or wss)")]
+    BadTransport(String),
 }
 
 /// A server reachable through a link: address plus, for backups, an optional
@@ -67,6 +69,19 @@ pub struct LinkServer {
     pub address: String,
     /// Server public key; `None` on a backup means "same as the primary".
     pub public_key: Option<PublicKey>,
+}
+
+/// Camouflage transport carried in a link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinkTransport {
+    /// WebSocket over TLS (`wss`) vs plain WebSocket (`ws`).
+    pub tls: bool,
+    /// WebSocket request path.
+    pub path: String,
+    /// TLS SNI; defaults to the server host when absent.
+    pub sni: Option<String>,
+    /// HTTP Host header; defaults to the SNI when absent.
+    pub host: Option<String>,
 }
 
 /// A parsed connect link.
@@ -82,6 +97,8 @@ pub struct ConnectLink {
     pub client_private_key: Option<PrivateKey>,
     /// Display label (person or device).
     pub label: Option<String>,
+    /// Camouflage transport; absent means plain TCP.
+    pub transport: Option<LinkTransport>,
 }
 
 /// Where the client key in an imported config came from.
@@ -129,9 +146,17 @@ impl ConnectLink {
 
         let mut backups = Vec::new();
         let mut client_private_key = None;
+        let mut t_kind: Option<String> = None;
+        let mut t_path: Option<String> = None;
+        let mut t_sni: Option<String> = None;
+        let mut t_host: Option<String> = None;
         for pair in query.unwrap_or("").split('&').filter(|p| !p.is_empty()) {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             match name {
+                "t" => t_kind = Some(value.to_string()),
+                "path" => t_path = Some(percent_decode(value)?),
+                "sni" => t_sni = Some(percent_decode(value)?),
+                "host" => t_host = Some(percent_decode(value)?),
                 "backup" => {
                     if value.is_empty() {
                         return Err(LinkError::EmptyValue(name.into()));
@@ -161,12 +186,24 @@ impl ConnectLink {
             None => None,
         };
 
+        let transport = match t_kind.as_deref() {
+            None => None,
+            Some("ws") | Some("wss") => Some(LinkTransport {
+                tls: t_kind.as_deref() == Some("wss"),
+                path: t_path.unwrap_or_else(|| "/".to_string()),
+                sni: t_sni,
+                host: t_host,
+            }),
+            Some(other) => return Err(LinkError::BadTransport(other.to_string())),
+        };
+
         Ok(Self {
             server,
             server_public_key,
             backups,
             client_private_key,
             label,
+            transport,
         })
     }
 
@@ -201,12 +238,22 @@ impl ConnectLink {
         } else {
             None
         };
+        let transport = cfg.transport.as_ref().and_then(|t| match t.kind.as_str() {
+            "ws" | "wss" => Some(LinkTransport {
+                tls: t.kind == "wss",
+                path: t.path.clone(),
+                sni: t.sni.clone(),
+                host: t.host.clone(),
+            }),
+            _ => None,
+        });
         Ok(Self {
             server: cfg.server.clone(),
             server_public_key,
             backups,
             client_private_key,
             label: None,
+            transport,
         })
     }
 
@@ -235,6 +282,13 @@ impl ConnectLink {
         let mut cfg = existing.cloned().unwrap_or_default();
         cfg.server = self.server.clone();
         cfg.server_public_key = self.server_public_key.to_base64();
+        cfg.transport = self.transport.as_ref().map(|t| ClientTransportConfig {
+            kind: if t.tls { "wss".to_string() } else { "ws".to_string() },
+            path: t.path.clone(),
+            sni: t.sni.clone(),
+            host: t.host.clone(),
+            insecure: false,
+        });
         cfg.backup_servers = self
             .backups
             .iter()
@@ -286,6 +340,21 @@ impl fmt::Display for ConnectLink {
         }
         if let Some(k) = &self.client_private_key {
             write!(f, "{}key={}", sep, encode_key(k.as_bytes()))?;
+        }
+        if let Some(t) = &self.transport {
+            let sep = if self.backups.is_empty() && self.client_private_key.is_none() {
+                '?'
+            } else {
+                '&'
+            };
+            write!(f, "{}t={}", sep, if t.tls { "wss" } else { "ws" })?;
+            write!(f, "&path={}", percent_encode(&t.path))?;
+            if let Some(sni) = &t.sni {
+                write!(f, "&sni={}", percent_encode(sni))?;
+            }
+            if let Some(host) = &t.host {
+                write!(f, "&host={}", percent_encode(host))?;
+            }
         }
         if let Some(label) = &self.label {
             write!(f, "#{}", percent_encode(label))?;
@@ -459,6 +528,7 @@ mod tests {
             backups: vec![],
             client_private_key: None,
             label: None,
+            transport: None,
         };
         let text = link.to_string();
         assert!(text.starts_with("phantom://"));
@@ -489,6 +559,12 @@ mod tests {
             ],
             client_private_key: Some(client.private.clone()),
             label: Some("Office laptop #2 (Sam's)".into()),
+            transport: Some(LinkTransport {
+                tls: true,
+                path: "/relay/path".into(),
+                sni: Some("www.example.com".into()),
+                host: None,
+            }),
         };
         let text = link.to_string();
         // Keys are base64url without padding: nothing that needs escaping.
@@ -505,6 +581,8 @@ mod tests {
         assert_eq!(back.backups, link.backups);
         assert_eq!(back.client_public_key(), Some(client.public));
         assert_eq!(back.label.as_deref(), Some("Office laptop #2 (Sam's)"));
+        assert_eq!(back.transport, link.transport, "transport must round-trip");
+        assert!(text.contains("t=wss") && text.contains("path=%2Frelay%2Fpath"), "{}", text);
         // Formatting is stable.
         assert_eq!(back.to_string(), text);
 
@@ -617,6 +695,7 @@ mod tests {
             backups: vec![],
             client_private_key: Some(client.private.clone()),
             label: None,
+            transport: None,
         };
         let dbg = format!("{:?}", link);
         assert!(!dbg.contains(&encode_key(client.private.as_bytes())));

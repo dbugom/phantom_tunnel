@@ -30,6 +30,7 @@
 pub mod config;
 pub mod crypto;
 pub mod link;
+pub mod transport;
 pub mod tunnel;
 
 pub use config::Config;

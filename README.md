@@ -17,15 +17,25 @@ An encrypted, multiplexed TCP/UDP tunnel with a local SOCKS5 / HTTP proxy, built
 - **Connect links** (`phantom://...`): set up a client from one pasted line
 - **Server hardening**: fail-closed allow-list, no logging of visited sites,
   private/LAN destinations refused, handshake timeout
+- **Camouflage (optional)**: carry the tunnel inside a real TLS + WebSocket
+  session behind a reverse proxy, so it looks like ordinary HTTPS to your
+  domain — see [docs/CAMOUFLAGE.md](docs/CAMOUFLAGE.md)
 
-### What it does not do
+### Encrypted by default; camouflaged on request
 
-The tunnel is **encrypted, not disguised**. On the wire it is length-prefixed
-Noise ciphertext over plain TCP — there is no TLS layer, no browser
-fingerprint mimicry, no padding or timing shaping, and no DNS transport. An
-observer cannot read the traffic, but traffic analysis can recognise that it is
-not ordinary HTTPS. Do not rely on it to hide the fact that you are using a
-tunnel.
+In the **default** (`plain`) transport the tunnel is **encrypted, not
+disguised**: length-prefixed Noise ciphertext over plain TCP. An observer
+cannot read it, but a modern censor can recognise high-entropy traffic as "not
+ordinary HTTPS" and block it.
+
+For hostile networks, the **`wss` transport** carries the whole tunnel inside a
+real TLS + WebSocket session. Pointed at a reverse proxy (e.g. Caddy) on a real
+HTTPS domain, the connection *is* HTTPS to that domain with a real certificate,
+and an active probe of the domain gets the real website. This is the
+WebTunnel/Trojan model and it reuses audited TLS rather than imitating it.
+See **[docs/CAMOUFLAGE.md](docs/CAMOUFLAGE.md)** for the threat model, the
+design, the Caddy config, and the honest limits (TLS client fingerprint and
+traffic analysis are *not* fully solved).
 
 ### Protocol versions and compatibility
 

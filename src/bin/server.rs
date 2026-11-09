@@ -11,7 +11,8 @@ use clap::Parser;
 use phantom_tunnel::{
     config::Config,
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
-    link::{self, ConnectLink},
+    link::{self, ConnectLink, LinkTransport},
+    transport::{self, ServerTransport},
     tunnel::{
         udp, Frame, FrameType, InboundRx, InboundTx, RecvWindow, StreamFlow, DEFAULT_WINDOW_SIZE,
         MAX_WINDOW_SIZE, PROTOCOL_VERSION,
@@ -19,9 +20,8 @@ use phantom_tunnel::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{debug, error, info, trace, warn};
 
@@ -75,6 +75,20 @@ enum Command {
         /// then a credential. Prints the public key to add to allowed_clients.
         #[arg(long)]
         new_client_key: bool,
+
+        /// Camouflage transport the link selects: "ws" or "wss" (carry the
+        /// tunnel inside a WebSocket, for a TLS reverse proxy in front).
+        /// Omit for plain TCP. The server itself must then run transport="ws".
+        #[arg(long)]
+        transport: Option<String>,
+
+        /// WebSocket path the reverse proxy routes to the tunnel (with --transport).
+        #[arg(long = "ws-path", default_value = "/", value_name = "PATH")]
+        ws_path: String,
+
+        /// TLS SNI / Host header for the link (defaults to the --address host).
+        #[arg(long)]
+        sni: Option<String>,
     },
 }
 
@@ -88,6 +102,9 @@ struct ServerState {
     conn_semaphore: Semaphore,
     /// Whether clients may reach private/loopback destinations (SSRF guard)
     allow_private_destinations: bool,
+    /// Outer transport the server accepts (plain TCP, or WebSocket behind a
+    /// TLS-terminating reverse proxy).
+    transport: ServerTransport,
 }
 
 /// Command to send data back through the tunnel
@@ -154,10 +171,23 @@ async fn main() -> Result<()> {
         backups,
         label,
         new_client_key,
+        transport,
+        ws_path,
+        sni,
     }) = &args.command
     {
         let listen = args.listen.as_deref().unwrap_or(&server_config.listen);
-        return print_link(&server_config, listen, address, backups, label.as_deref(), *new_client_key);
+        return print_link(
+            &server_config,
+            listen,
+            address,
+            backups,
+            label.as_deref(),
+            *new_client_key,
+            transport.as_deref(),
+            ws_path,
+            sni.as_deref(),
+        );
     }
 
     // Parse or generate server keypair
@@ -206,11 +236,26 @@ async fn main() -> Result<()> {
     }
 
     // Create server state
+    let transport = match server_config.transport.as_str() {
+        "plain" => ServerTransport::Plain,
+        "ws" => ServerTransport::WebSocket,
+        other => {
+            return Err(anyhow!(
+                "unknown server transport {:?} in config (use \"plain\" or \"ws\")",
+                other
+            ))
+        }
+    };
+    if matches!(transport, ServerTransport::WebSocket) {
+        info!("Accepting WebSocket transport (expects a TLS-terminating reverse proxy in front)");
+    }
+
     let state = Arc::new(ServerState {
         keypair,
         allowed_clients,
         conn_semaphore: Semaphore::new(server_config.max_connections),
         allow_private_destinations: server_config.allow_private_destinations,
+        transport,
     });
 
     // Determine listen address
@@ -279,6 +324,7 @@ fn generate_keypair() -> Result<()> {
 }
 
 /// `phantom-server link`: print a connect link for clients of this server.
+#[allow(clippy::too_many_arguments)]
 fn print_link(
     server_config: &phantom_tunnel::config::ServerConfig,
     listen: &str,
@@ -286,7 +332,22 @@ fn print_link(
     backups: &[String],
     label: Option<&str>,
     new_client_key: bool,
+    transport: Option<&str>,
+    ws_path: &str,
+    sni: Option<&str>,
 ) -> Result<()> {
+    let link_transport = match transport {
+        None | Some("plain") => None,
+        Some(kind @ ("ws" | "wss")) => Some(LinkTransport {
+            tls: kind == "wss",
+            path: ws_path.to_string(),
+            sni: sni.map(str::to_string),
+            host: None,
+        }),
+        Some(other) => {
+            return Err(anyhow!("unknown --transport {:?} (use ws or wss)", other))
+        }
+    };
     // Prefer the key derived from private_key: it is what the handshake uses.
     let server_public_key = if !server_config.private_key.is_empty() {
         PrivateKey::from_base64(&server_config.private_key)
@@ -320,6 +381,7 @@ fn print_link(
         backups,
         client_private_key: client.as_ref().map(|c| c.private.clone()),
         label: label.map(str::to_string),
+        transport: link_transport.clone(),
     }
     .to_string();
     // Round-trip through the parser so we never hand out a link the client
@@ -347,6 +409,16 @@ fn print_link(
             eprintln!("The link has no client key. Importing it prints the device's public key;");
             eprintln!("add that key to allowed_clients to let it connect.");
         }
+    }
+    if let Some(t) = &link_transport {
+        eprintln!();
+        eprintln!(
+            "Camouflage: this link uses {} at path {}. For it to work, this server must run",
+            if t.tls { "WebSocket-over-TLS (wss)" } else { "plain WebSocket (ws)" },
+            t.path
+        );
+        eprintln!("with transport = \"ws\" behind a TLS reverse proxy (e.g. Caddy) that routes");
+        eprintln!("that path to it. See docs/CAMOUFLAGE.md.");
     }
     Ok(())
 }
@@ -412,8 +484,16 @@ async fn handle_connection(stream: TcpStream, state: Arc<ServerState>) -> Result
     // algorithm interacts with delayed-ACK to add up to ~40ms per round trip.
     stream.set_nodelay(true).ok();
 
-    // Split stream for handshake
-    let (mut read_half, mut write_half) = stream.into_split();
+    // Establish the outer transport (plain split, or accept the WebSocket).
+    // Timed out so a client that opens TCP but never finishes the WebSocket
+    // handshake cannot hold a connection permit.
+    let (mut read_half, mut write_half) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        transport::accept_server(&state.transport, stream),
+    )
+    .await
+    .map_err(|_| anyhow!("Transport handshake timed out"))?
+    .context("Failed to establish transport")?;
 
     // Perform Noise handshake with a timeout so a client that connects but never
     // completes the handshake can't hold a connection permit indefinitely.
@@ -698,11 +778,15 @@ fn parse_destination(payload: &[u8]) -> Option<String> {
 /// Perform Noise IK handshake with split streams.
 /// Returns the transport, the client's static public key, and the client's
 /// protocol version (0 if the client is a v1 build that sent no version byte).
-async fn perform_handshake_split(
-    read_half: &mut OwnedReadHalf,
-    write_half: &mut OwnedWriteHalf,
+async fn perform_handshake_split<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
     keypair: &KeyPair,
-) -> Result<(NoiseTransport, PublicKey, u8)> {
+) -> Result<(NoiseTransport, PublicKey, u8)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut handshake = NoiseHandshake::new_responder(keypair)
         .context("Failed to create handshake")?;
 
@@ -746,11 +830,14 @@ async fn perform_handshake_split(
 }
 
 /// Send an encrypted frame using split write half
-async fn send_frame_write(
-    write_half: &mut OwnedWriteHalf,
+async fn send_frame_write<W>(
+    write_half: &mut W,
     noise: &mut NoiseTransport,
     frame: &Frame,
-) -> Result<()> {
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let plaintext = frame.encode();
     // 2-byte length prefix + ciphertext in one buffer → one TCP segment.
     let mut out = vec![0u8; 2 + plaintext.len() + 16];

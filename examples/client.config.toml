@@ -37,6 +37,15 @@ http_listen = "127.0.0.1:8080"
 #     { address = "backup.example.net:443", public_key = "BACKUP_SERVER_PUBLIC_KEY" },
 # ]
 
+# Camouflage: carry the tunnel inside a real TLS + WebSocket session so it looks
+# like ordinary HTTPS to your domain (requires a reverse proxy such as Caddy in
+# front of the server; see docs/CAMOUFLAGE.md). Omit this section for plain TCP.
+# [client.transport]
+# type = "wss"              # "plain" (default), "wss" (TLS+WebSocket), or "ws"
+# path = "/relay"           # the secret path your reverse proxy routes to the tunnel
+# sni  = "vpn.example.com"  # TLS server name; defaults to the host of `server`
+# host = "vpn.example.com"  # HTTP Host header; defaults to sni
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

@@ -11,9 +11,10 @@
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use phantom_tunnel::{
-    config::{ClientConfig, Config},
+    config::{ClientConfig, ClientTransportConfig, Config},
     crypto::{KeyPair, NoiseHandshake, NoiseTransport, PrivateKey, PublicKey},
     link::{self, ConnectLink, KeySource},
+    transport::{self, ClientTransport, WsClient},
     tunnel::{
         udp, Frame, FrameType, InboundRx, InboundTx, RecvWindow, StreamFlow, DEFAULT_WINDOW_SIZE,
         MAX_STREAMS, MAX_WINDOW_SIZE, PROTOCOL_VERSION,
@@ -21,7 +22,7 @@ use phantom_tunnel::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::{mpsc, oneshot};
@@ -85,6 +86,49 @@ struct Endpoint {
     addr: String,
     /// The server's static public key.
     public_key: PublicKey,
+    /// How the tunnel is dressed up on the wire (plain TCP, or WebSocket/TLS).
+    transport: ClientTransport,
+}
+
+/// Host part of a `host:port` (strips the port; unwraps `[v6]`).
+fn host_of(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(addr)
+    } else {
+        addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
+    }
+}
+
+/// Build the wire transport for one server from the client's transport config.
+/// SNI and Host default to the dialled host, so dialling the real domain needs
+/// no extra settings; dialling by IP needs an explicit `sni`.
+fn build_client_transport(
+    cfg: Option<&ClientTransportConfig>,
+    dial_addr: &str,
+) -> Result<ClientTransport> {
+    let cfg = match cfg {
+        Some(c) => c,
+        None => return Ok(ClientTransport::Plain),
+    };
+    match cfg.kind.as_str() {
+        "plain" => Ok(ClientTransport::Plain),
+        "ws" | "wss" => {
+            let host = host_of(dial_addr).to_string();
+            let sni = cfg.sni.clone().unwrap_or_else(|| host.clone());
+            let host_header = cfg.host.clone().or_else(|| cfg.sni.clone()).unwrap_or(host);
+            Ok(ClientTransport::WebSocket(WsClient {
+                tls: cfg.kind == "wss",
+                path: cfg.path.clone(),
+                sni,
+                host: host_header,
+                insecure: cfg.insecure,
+            }))
+        }
+        other => Err(anyhow!(
+            "unknown client transport type {:?} (use \"plain\", \"ws\", or \"wss\")",
+            other
+        )),
+    }
 }
 
 /// Client state
@@ -250,8 +294,10 @@ async fn main() -> Result<()> {
         .context("Invalid server public key")?;
 
     // Primary first, then backups in config order.
+    let primary_addr = args.server.clone().unwrap_or_else(|| client_config.server.clone());
     let mut servers = vec![Endpoint {
-        addr: args.server.clone().unwrap_or_else(|| client_config.server.clone()),
+        transport: build_client_transport(client_config.transport.as_ref(), &primary_addr)?,
+        addr: primary_addr,
         public_key: server_public.clone(),
     }];
     for (i, b) in client_config.backup_servers.iter().enumerate() {
@@ -264,6 +310,7 @@ async fn main() -> Result<()> {
                 .with_context(|| format!("Invalid public_key for backup server {}", b.address))?
         };
         servers.push(Endpoint {
+            transport: build_client_transport(client_config.transport.as_ref(), &b.address)?,
             addr: b.address.clone(),
             public_key,
         });
@@ -611,18 +658,17 @@ async fn run_tunnel(
 ) -> Result<()> {
     let endpoint = &state.servers[server];
 
-    // Connect to server
-    let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&endpoint.addr))
-        .await
-        .map_err(|_| anyhow!("timed out connecting after {}s", CONNECT_TIMEOUT.as_secs()))?
-        .context("Failed to connect")?;
-    // Disable Nagle to avoid ~40ms delayed-ACK stalls on our small frames.
-    stream.set_nodelay(true).ok();
+    // Establish the outer transport (plain TCP, or WebSocket/TLS camouflage).
+    // The timeout covers the whole outer handshake (TCP + TLS + WebSocket).
+    let (mut read_half, mut write_half) = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        transport::connect_client(&endpoint.transport, &endpoint.addr),
+    )
+    .await
+    .map_err(|_| anyhow!("timed out connecting after {}s", CONNECT_TIMEOUT.as_secs()))?
+    .context("Failed to connect")?;
 
     info!("Connected to {}, performing handshake...", endpoint.addr);
-
-    // Split stream for handshake (we'll need both halves)
-    let (mut read_half, mut write_half) = stream.into_split();
 
     // Perform Noise handshake using both halves
     let (mut noise_transport, peer_version) = tokio::time::timeout(
@@ -908,12 +954,16 @@ async fn run_tunnel(
 /// Perform Noise IK handshake with split streams.
 /// Returns the transport and the peer's negotiated protocol version (0 if the
 /// server is a v1 build that sent no version byte).
-async fn perform_handshake_split(
-    read_half: &mut OwnedReadHalf,
-    write_half: &mut OwnedWriteHalf,
+async fn perform_handshake_split<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
     keypair: &KeyPair,
     server_public: &PublicKey,
-) -> Result<(NoiseTransport, u8)> {
+) -> Result<(NoiseTransport, u8)>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut handshake = NoiseHandshake::new_initiator(keypair, server_public)
         .context("Failed to create handshake")?;
 
@@ -956,11 +1006,14 @@ async fn perform_handshake_split(
 /// The 2-byte length prefix and ciphertext are written in a single buffer so
 /// they go out as one TCP segment (with TCP_NODELAY set), rather than two
 /// writes that could be split and incur extra round-trip latency.
-async fn send_frame_write(
-    write_half: &mut OwnedWriteHalf,
+async fn send_frame_write<W>(
+    write_half: &mut W,
     noise: &mut NoiseTransport,
     frame: &Frame,
-) -> Result<()> {
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let plaintext = frame.encode();
     // 2-byte length prefix + ciphertext (plaintext + 16-byte tag).
     let mut out = vec![0u8; 2 + plaintext.len() + 16];

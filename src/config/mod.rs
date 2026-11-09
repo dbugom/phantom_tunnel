@@ -66,6 +66,17 @@ pub struct ServerConfig {
     /// localhost, LAN, and cloud metadata endpoint (169.254.169.254).
     #[serde(default)]
     pub allow_private_destinations: bool,
+    /// Outer transport the server accepts: `"plain"` (raw Noise over TCP,
+    /// the default) or `"ws"` (accept a WebSocket; TLS is terminated upstream
+    /// by a reverse proxy such as Caddy, so the server itself speaks plain ws).
+    /// See docs/CAMOUFLAGE.md.
+    #[serde(default = "default_server_transport")]
+    pub transport: String,
+}
+
+/// Default outer transport for the server: raw Noise over TCP.
+pub fn default_server_transport() -> String {
+    "plain".to_string()
 }
 
 impl Default for ServerConfig {
@@ -77,6 +88,7 @@ impl Default for ServerConfig {
             allowed_clients: Vec::new(),
             max_connections: 1000,
             allow_private_destinations: false,
+            transport: default_server_transport(),
         }
     }
 }
@@ -103,6 +115,59 @@ pub struct ClientConfig {
     /// as `server_public_key`) or `{ address = "host:port", public_key = "..." }`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub backup_servers: Vec<BackupServer>,
+    /// Outer transport / camouflage. Absent means raw Noise over TCP (`plain`).
+    /// Set it to carry the tunnel inside a WebSocket over TLS (`wss`). See
+    /// docs/CAMOUFLAGE.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transport: Option<ClientTransportConfig>,
+}
+
+/// Outer transport / camouflage settings for the client.
+///
+/// A `wss` transport carries the tunnel inside a real TLS + WebSocket session,
+/// so that — pointed at a reverse proxy on a real HTTPS domain — the traffic is
+/// indistinguishable from ordinary web traffic to that site.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientTransportConfig {
+    /// `"plain"` (raw Noise over TCP), `"wss"` (WebSocket over TLS), or `"ws"`
+    /// (plain WebSocket, when a local terminator provides TLS).
+    #[serde(default = "default_transport_type", rename = "type")]
+    pub kind: String,
+    /// WebSocket request path the reverse proxy routes to the tunnel.
+    #[serde(default = "default_ws_path")]
+    pub path: String,
+    /// TLS SNI / server name. Defaults to the host part of `server`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sni: Option<String>,
+    /// HTTP `Host` header. Defaults to `sni` (or the host part of `server`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    /// Skip TLS certificate verification. Self-signed test servers only; never
+    /// use against a real deployment.
+    #[serde(default)]
+    pub insecure: bool,
+}
+
+/// Default client transport kind: raw Noise over TCP.
+pub fn default_transport_type() -> String {
+    "plain".to_string()
+}
+
+/// Default WebSocket path.
+pub fn default_ws_path() -> String {
+    "/".to_string()
+}
+
+impl Default for ClientTransportConfig {
+    fn default() -> Self {
+        Self {
+            kind: default_transport_type(),
+            path: default_ws_path(),
+            sni: None,
+            host: None,
+            insecure: false,
+        }
+    }
 }
 
 impl Default for ClientConfig {
@@ -115,6 +180,7 @@ impl Default for ClientConfig {
             socks5_listen: Some("127.0.0.1:1080".to_string()),
             http_listen: Some("127.0.0.1:8080".to_string()),
             backup_servers: Vec::new(),
+            transport: None,
         }
     }
 }

@@ -28,6 +28,11 @@ allowed_clients = [
 # Increase for high-traffic servers
 max_connections = 1000
 
+# Outer transport. "plain" (default) accepts raw Noise over TCP. "ws" accepts a
+# WebSocket, for running behind a TLS-terminating reverse proxy (camouflage) —
+# see docs/CAMOUFLAGE.md. TLS is then the proxy's job, not this server's.
+# transport = "ws"
+
 [logging]
 # Log level: trace, debug, info, warn, error
 level = "info"

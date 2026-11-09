@@ -7,6 +7,11 @@
 
 This guide covers deploying Phantom Tunnel for secure, censorship-resistant communication.
 
+> **Censorship resistance / camouflage.** By default the tunnel is encrypted
+> but recognisable as non-HTTPS traffic. To make it look like ordinary HTTPS to
+> a real domain (behind Caddy/nginx), see **[CAMOUFLAGE.md](CAMOUFLAGE.md)** —
+> threat model, design, reverse-proxy config and limits.
+
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
@@ -283,6 +288,7 @@ export ALL_PROXY=socks5://127.0.0.1:1080
 | `allowed_clients` | List of allowed client public keys | `[]` |
 | `max_connections` | Maximum concurrent connections | `1000` |
 | `allow_private_destinations` | Let clients reach the server's LAN, localhost and cloud metadata addresses | `false` |
+| `transport` | Outer transport: `"plain"` (Noise over TCP) or `"ws"` (accept a WebSocket behind a TLS reverse proxy — camouflage) | `"plain"` |
 
 ### Client Options
 
@@ -294,6 +300,7 @@ export ALL_PROXY=socks5://127.0.0.1:1080
 | `socks5_listen` | Local SOCKS5 proxy address | `127.0.0.1:1080` |
 | `http_listen` | Local HTTP proxy address | `127.0.0.1:8080` |
 | `backup_servers` | Fallback servers, tried in order: `"host:port"` (same server key) or `{ address = "host:port", public_key = "..." }` | `[]` |
+| `[client.transport]` | Camouflage: `type` (`plain`/`ws`/`wss`), `path`, `sni`, `host`. See [CAMOUFLAGE.md](CAMOUFLAGE.md) | plain |
 
 `public_key` is optional: the client and server derive it from `private_key`
 and warn if a stored copy doesn't match.
